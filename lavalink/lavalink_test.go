@@ -106,3 +106,30 @@ func TestLoadResult(t *testing.T) {
 		t.Error("unknown load type should be rejected")
 	}
 }
+
+// A node rejects the whole player update when any of the four voice fields is missing, so an
+// incomplete state must never be sent — channel id included.
+func TestVoiceStateComplete(t *testing.T) {
+	full := VoiceState{Token: "t", Endpoint: "e", SessionID: "s", ChannelID: "c"}
+	if !full.Complete() {
+		t.Error("a full voice state is not complete")
+	}
+	for name, state := range map[string]VoiceState{
+		"no token":      {Endpoint: "e", SessionID: "s", ChannelID: "c"},
+		"no endpoint":   {Token: "t", SessionID: "s", ChannelID: "c"},
+		"no session id": {Token: "t", Endpoint: "e", ChannelID: "c"},
+		"no channel id": {Token: "t", Endpoint: "e", SessionID: "s"},
+	} {
+		if state.Complete() {
+			t.Errorf("%s: reported complete", name)
+		}
+	}
+
+	raw, err := json.Marshal(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"token":"t","endpoint":"e","sessionId":"s","channelId":"c"}`; string(raw) != want {
+		t.Errorf("got %s, want %s", raw, want)
+	}
+}

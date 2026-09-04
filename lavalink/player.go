@@ -15,11 +15,13 @@ type VoiceState struct {
 	Token     string `json:"token"`
 	Endpoint  string `json:"endpoint"`
 	SessionID string `json:"sessionId"`
+	ChannelID string `json:"channelId"`
 }
 
-// Complete reports whether the state can be handed to a node.
+// Complete reports whether the state can be handed to a node. A node rejects the whole update when
+// any of the four is missing, channel id included.
 func (v VoiceState) Complete() bool {
-	return v.Token != "" && v.Endpoint != "" && v.SessionID != ""
+	return v.Token != "" && v.Endpoint != "" && v.SessionID != "" && v.ChannelID != ""
 }
 
 // PlayerInfo is a player as the node sees it.

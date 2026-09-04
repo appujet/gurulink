@@ -31,17 +31,17 @@ func (p *Player) Disconnect(ctx context.Context) error {
 	return p.client.cfg.SendVoiceUpdate(ctx, p.guildID, nil, false, false)
 }
 
-// onVoiceState takes Discord's voice state for the bot. Only the session id
-// matters to a node, and it only changes when the voice session is rebuilt.
+// onVoiceState takes Discord's voice state for the bot. The node needs the session id and the
+// channel, and neither changes unless the voice session is rebuilt or the bot is moved.
 func (p *Player) onVoiceState(ctx context.Context, channelID, sessionID string) error {
 	p.mu.Lock()
 	p.channelID = channelID
-	same := p.voice.SessionID == sessionID
-	p.voice.SessionID = sessionID
+	before := p.voice
+	p.voice.SessionID, p.voice.ChannelID = sessionID, channelID
 	voice := p.voice
 	p.mu.Unlock()
 
-	if same || !voice.Complete() {
+	if voice == before || !voice.Complete() {
 		return nil
 	}
 	return p.update(ctx, lavalink.PlayerUpdate{Voice: &voice})
