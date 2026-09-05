@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/appujet/gurulink/gurulink"
 	"github.com/appujet/gurulink/lavalink"
@@ -20,6 +21,10 @@ func onCommand(link *gurulink.Client, e *events.ApplicationCommandInteractionCre
 	}
 	guildID := e.GuildID().String()
 
+	// An interaction has its own deadline, so give the calls it makes one.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
 	switch e.Data.CommandName() {
 	case "play":
 		voice, ok := e.Client().Caches.VoiceState(*e.GuildID(), e.User().ID)
@@ -27,7 +32,7 @@ func onCommand(link *gurulink.Client, e *events.ApplicationCommandInteractionCre
 			reply("join a voice channel first")
 			return
 		}
-		if err := play(link, guildID, voice.ChannelID.String(), e.SlashCommandInteractionData().String("query"), reply); err != nil {
+		if err := play(ctx, link, guildID, voice.ChannelID.String(), e.SlashCommandInteractionData().String("query"), reply); err != nil {
 			slog.Error("play", slog.Any("err", err))
 			reply("that did not work: %s", err)
 		}
@@ -38,7 +43,7 @@ func onCommand(link *gurulink.Client, e *events.ApplicationCommandInteractionCre
 			reply("nothing is playing")
 			return
 		}
-		if err := player.Skip(context.TODO()); err != nil {
+		if err := player.Skip(ctx); err != nil {
 			reply("that did not work: %s", err)
 			return
 		}
@@ -50,7 +55,7 @@ func onCommand(link *gurulink.Client, e *events.ApplicationCommandInteractionCre
 			reply("nothing is playing")
 			return
 		}
-		if err := player.Destroy(context.TODO(), gurulink.DestroyRequested); err != nil {
+		if err := player.Destroy(ctx, gurulink.DestroyRequested); err != nil {
 			reply("that did not work: %s", err)
 			return
 		}
@@ -58,12 +63,11 @@ func onCommand(link *gurulink.Client, e *events.ApplicationCommandInteractionCre
 	}
 }
 
-func play(link *gurulink.Client, guildID, channelID, query string, reply func(string, ...any)) error {
+func play(ctx context.Context, link *gurulink.Client, guildID, channelID, query string, reply func(string, ...any)) error {
 	player, err := link.NewPlayer(guildID)
 	if err != nil {
 		return err
 	}
-	ctx := context.TODO()
 	if err = player.Connect(ctx, channelID, false, true); err != nil {
 		return err
 	}
@@ -80,18 +84,17 @@ func play(link *gurulink.Client, guildID, channelID, query string, reply func(st
 		reply("nothing found for %q", query)
 		return nil
 	}
-	// A search hands back everything it matched; only a link to a playlist queues
-	// more than one.
+	// A search matches many tracks; only a playlist link should queue them all.
 	if result.LoadType == lavalink.LoadTypeSearch {
 		tracks = tracks[:1]
 	}
 
 	if player.Playing() {
-		player.Queue().Add(tracks...)
+		player.Queue().Add(ctx, tracks...)
 		reply("queued %d track(s), first up: %s", len(tracks), tracks[0].Info.Title)
 		return nil
 	}
-	player.Queue().Add(tracks[1:]...)
+	player.Queue().Add(ctx, tracks[1:]...)
 	if err = player.Play(ctx, tracks[0]); err != nil {
 		return err
 	}

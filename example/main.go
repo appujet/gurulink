@@ -47,15 +47,20 @@ func main() {
 			if e.VoiceState.ChannelID != nil {
 				update.ChannelID = e.VoiceState.ChannelID.String()
 			}
-			if err := link.OnVoiceStateUpdate(context.TODO(), update); err != nil {
+			// A node call needs a context and disgo gives its listeners none.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := link.OnVoiceStateUpdate(ctx, update); err != nil {
 				slog.Error("voice state update", slog.Any("err", err))
 			}
 		}),
 		bot.WithEventListenerFunc(func(e *events.VoiceServerUpdate) {
 			if e.Endpoint == nil {
-				return // Discord is moving us to another voice server; the next one is real.
+				return // Discord is moving us; the next endpoint is the real one.
 			}
-			if err := link.OnVoiceServerUpdate(context.TODO(), e.GuildID.String(), e.Token, *e.Endpoint); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := link.OnVoiceServerUpdate(ctx, e.GuildID.String(), e.Token, *e.Endpoint); err != nil {
 				slog.Error("voice server update", slog.Any("err", err))
 			}
 		}),
@@ -70,8 +75,7 @@ func main() {
 	defer discordClient.Close(context.TODO())
 
 	link, err = gurulink.New(gurulink.Config{
-		// A bot's user id is its application id, and that one is in the token, so
-		// this works before the gateway is even open.
+		// The application id is in the token, so this works before the gateway opens.
 		UserID: discordClient.ApplicationID.String(),
 		SendVoiceUpdate: func(ctx context.Context, guildID string, channelID *string, selfMute, selfDeaf bool) error {
 			var channel *snowflake.ID

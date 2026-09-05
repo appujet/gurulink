@@ -1,6 +1,5 @@
-// Package store has ready-made queue stores. It moves bytes and nothing else,
-// so it imports nothing of gurulink; anything here satisfies queue.Store
-// structurally.
+// Package store has ready-made queue stores. It only moves bytes, so it imports
+// nothing of gurulink; anything here satisfies queue.Store structurally.
 package store
 
 import (
@@ -12,8 +11,8 @@ import (
 	"sync"
 )
 
-// Memory keeps queues in a map: they survive a node reconnect, but not a
-// restart. Safe for concurrent use.
+// Memory keeps queues in a map: they survive a reconnect, not a restart. Safe
+// for concurrent use.
 type Memory struct {
 	mu   sync.RWMutex
 	data map[string][]byte
@@ -43,17 +42,14 @@ func (m *Memory) Delete(_ context.Context, guildID string) error {
 }
 
 // File keeps one file per guild under Dir, so queues outlive a restart. Writes
-// are atomic; concurrent writes for one guild are the caller's problem, and
-// gurulink only ever has one goroutine saving a given queue.
+// are atomic; gurulink only ever has one goroutine saving a given queue.
 //
-// ponytail: a file per guild, rewritten whole. Point [Memory] or your own
-// database store at it if you outgrow that.
+// ponytail: rewritten whole. Write your own store if you outgrow that.
 type File struct {
 	Dir string
 }
 
-// guildPath is Dir/<guildID>.json, rejecting anything that is not a snowflake
-// so a crafted guild id cannot escape Dir.
+// guildPath is Dir/<guildID>.json, numeric only so a crafted id cannot escape Dir.
 func (f File) guildPath(guildID string) (string, error) {
 	if guildID == "" {
 		return "", errors.New("store: empty guild id")

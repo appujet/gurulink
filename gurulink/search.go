@@ -21,15 +21,14 @@ func IsLink(q string) bool {
 	return strings.HasPrefix(q, "http://") || strings.HasPrefix(q, "https://")
 }
 
-// Source resolves a shorthand such as "yt", "spotify" or "ytmsearch" to the
-// search prefix a node expects. It reports false for anything unknown.
+// Source resolves a shorthand such as "yt" or "spotify" to a node's search
+// prefix, false for anything unknown.
 func Source(name string) (string, bool) {
 	src, ok := sourceAliases[strings.ToLower(strings.TrimSpace(name))]
 	return src, ok
 }
 
-// SourceOf returns the prefix a query already carries, as in
-// "ytsearch:never gonna", or "" when it carries none.
+// SourceOf is the prefix a query carries, as in "yt:never gonna", else "".
 func SourceOf(query string) string {
 	prefix, _, ok := strings.Cut(query, ":")
 	if !ok {
@@ -42,9 +41,8 @@ func SourceOf(query string) string {
 	return src
 }
 
-// identifier turns a user query into a /loadtracks identifier. A URL is passed
-// through untouched, anything else gets the source prefix it asked for, or the
-// configured default.
+// identifier turns a query into a /loadtracks identifier. A URL passes through;
+// otherwise the query's own prefix wins, then source, then the default.
 func (c *Client) identifier(query, source string) (string, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -53,27 +51,27 @@ func (c *Client) identifier(query, source string) (string, error) {
 	if IsLink(query) {
 		return query, nil
 	}
-	if SourceOf(query) != "" {
-		return query, nil
-	}
-	src := c.cfg.DefaultSource
-	if source != "" {
+
+	src, terms := c.cfg.DefaultSource, query
+	// The query's own prefix is an alias too: a node only knows "ytsearch:x".
+	if own := SourceOf(query); own != "" {
+		_, terms, _ = strings.Cut(query, ":")
+		src, terms = own, strings.TrimSpace(terms)
+	} else if source != "" {
 		resolved, ok := Source(source)
 		if !ok {
 			return "", fmt.Errorf("gurulink: unknown search source %q", source)
 		}
 		src = resolved
 	}
-	if src == "speak" && len(query) > 100 {
+	if src == "speak" && len(terms) > 100 {
 		return "", ErrSpeakQueryTooLong
 	}
-	return src + ":" + query, nil
+	return src + ":" + terms, nil
 }
 
-// sourceAliases maps every shorthand lavalink-client accepts (MIT; see NOTICE)
-// to the search prefix a node understands. A prefix always maps to itself, so
-// users can pass either. Whether a node actually has the source is the node's
-// problem.
+// sourceAliases maps every shorthand lavalink-client accepts (MIT; see NOTICE) to
+// a node's search prefix. A prefix maps to itself, so either works.
 var sourceAliases = map[string]string{
 	"ytmsearch":    "ytmsearch",
 	"ytm":          "ytmsearch",

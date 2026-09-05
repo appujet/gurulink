@@ -21,8 +21,7 @@ func (p *Player) startIdle() {
 		p.idleTimer.Stop()
 	}
 	p.idleTimer = time.AfterFunc(timeout, func() {
-		// A track that started in the meantime cancelled the timer, but a racing
-		// fire still gets here, so check before pulling the plug.
+		// A racing fire still gets here after the timer was cancelled.
 		if p.queue.Current() != nil || p.queue.Len() > 0 {
 			return
 		}
@@ -50,10 +49,9 @@ func (p *Player) stopIdle() {
 	}
 }
 
-// handle reacts to a node event, after the client's listeners have seen it. It
-// runs on the node's read loop, so anything that talks back to a node gets its
-// own goroutine and its own timeout.
-func (p *Player) handle(event Event) {
+// handle reacts to a node event after the listeners saw it, on the read loop:
+// anything talking back to the node gets its own goroutine and timeout.
+func (p *Player) handle(ctx context.Context, event Event) {
 	switch e := event.(type) {
 	case *TrackStartEvent:
 		p.mu.Lock()
@@ -62,17 +60,17 @@ func (p *Player) handle(event Event) {
 		p.stopIdle()
 		// [Player.PlayIdentifier] and a resumed session leave us without one.
 		if p.queue.Current() == nil {
-			p.queue.SetCurrent(&e.Track)
+			p.queue.SetCurrent(ctx, &e.Track)
 		}
 		if p.crossfading() {
 			go p.background(p.PreBuffer)
 		}
 
 	case *TrackPromotedEvent:
-		p.promoted(e.Track)
+		p.promoted(ctx, e.Track)
 
 	case *TrackEndEvent:
-		p.ended(e)
+		p.ended(ctx, e)
 
 	case *TrackExceptionEvent:
 		// The node follows this with a TrackEnd that moves on, so only count it.
@@ -90,9 +88,9 @@ func (p *Player) handle(event Event) {
 }
 
 // ended decides what follows a finished track.
-func (p *Player) ended(e *TrackEndEvent) {
-	// A crossfade already started the successor: TrackPromotedEvent moves the
-	// queue. Stopped, replaced and cleanup mean somebody else is driving.
+func (p *Player) ended(ctx context.Context, e *TrackEndEvent) {
+	// A crossfade moves the queue on TrackPromotedEvent; stopped, replaced and
+	// cleanup mean somebody else is driving.
 	if e.Reason.Promoted() || !e.Reason.StartNext() {
 		return
 	}
@@ -101,20 +99,18 @@ func (p *Player) ended(e *TrackEndEvent) {
 		go p.background(func(ctx context.Context) error { return p.play(ctx, e.Track) })
 		return
 	case RepeatQueue:
-		p.queue.Add(e.Track)
+		p.queue.Add(ctx, e.Track)
 	}
 	go p.background(func(ctx context.Context) error { return p.next(ctx, e.Reason) })
 }
 
-// promoted catches the queue up with a node that already switched to the
-// pre-buffered successor.
-func (p *Player) promoted(track lavalink.Track) {
+// promoted catches the queue up with a node that already switched.
+func (p *Player) promoted(ctx context.Context, track lavalink.Track) {
 	if next, ok := p.queue.Peek(); ok && next.Encoded == track.Encoded {
-		p.queue.Advance()
+		p.queue.Advance(ctx)
 	} else {
-		// ponytail: the queue moved under the pre-buffer, so take the node's word
-		// for what plays instead of trying to reconcile the two.
-		p.queue.SetCurrent(&track)
+		// ponytail: the queue moved under the pre-buffer, so take the node's word.
+		p.queue.SetCurrent(ctx, &track)
 	}
 	if p.crossfading() {
 		go p.background(p.PreBuffer)
@@ -152,8 +148,7 @@ func (p *Player) voiceClosed(code int) {
 			return
 		}
 		p.client.emit(&PlayerReconnectEvent{Player: p, ChannelID: channelID})
-		// The voice session is dead for good. Leaving and rejoining is what makes
-		// Discord hand out a new one.
+		// Only leaving and rejoining makes Discord hand out a new session.
 		go p.background(func(ctx context.Context) error {
 			if err := p.Disconnect(ctx); err != nil {
 				return err
@@ -169,8 +164,7 @@ func (p *Player) crossfading() bool {
 	return crossfade != nil && crossfade.Enable
 }
 
-// background runs a node call off the read loop and reports the failure as an
-// [ErrorEvent], since nobody is waiting for it.
+// background runs a node call off the read loop, failures as an [ErrorEvent].
 func (p *Player) background(f func(ctx context.Context) error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

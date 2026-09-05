@@ -10,64 +10,57 @@ import (
 	"github.com/appujet/gurulink/queue"
 )
 
-// Config configures a [Client]. Only UserID and SendVoiceUpdate are required;
-// everything else has a working default.
+// Config configures a [Client]. Only UserID and SendVoiceUpdate are required.
 type Config struct {
 	// UserID is the bot's own user id, which nodes want on every connection.
 	UserID string
 	// ClientName goes into the Client-Name header. Defaults to "gurulink".
 	ClientName string
-	// SendVoiceUpdate makes the Discord gateway shard holding guildID send a
-	// voice state update; a nil channelID leaves the channel. This is the only
-	// thing gurulink needs from a Discord library.
+	// SendVoiceUpdate sends a voice state update through your Discord library, the
+	// one thing gurulink needs from it. A nil channelID leaves the channel.
 	SendVoiceUpdate func(ctx context.Context, guildID string, channelID *string, selfMute, selfDeaf bool) error
 	// Logger defaults to [slog.Default].
 	Logger *slog.Logger
-	// HTTPClient talks to node REST APIs. Defaults to a 10s timeout; replace it
-	// to get proxies, h2c or your own transport.
+	// HTTPClient talks to node REST APIs. Defaults to a 10s timeout.
 	HTTPClient *http.Client
 	// Listeners receive every event, in order, on the node's read loop.
 	Listeners []Listener
 
-	// DefaultSource is the search prefix for queries that name none.
+	// DefaultSource is the search prefix, or an alias, for queries naming none.
+	// Defaults to [DefaultSource]; an unknown one fails [New].
 	DefaultSource string
 
 	// QueueStore persists queues; nil keeps them in memory only.
 	QueueStore queue.Store
-	// OnQueueChange is told about every queue change, for a now-playing message
-	// or a UI that has to keep up.
-	OnQueueChange func(guildID string, change queue.Change, tracks []lavalink.Track)
+	// OnQueueChange is told about every queue change, for a now-playing message.
+	OnQueueChange func(ctx context.Context, guildID string, change queue.Change, tracks []lavalink.Track)
 
 	// Autoplay is asked for more tracks when a queue runs dry, before
-	// [QueueEndEvent] fires. Add them to the player's queue; adding none ends
-	// the queue.
+	// [QueueEndEvent]. Add them to the player's queue; adding none ends it.
 	Autoplay func(ctx context.Context, player *Player) error
-	// EmptyQueueTimeout destroys a player this long after its queue ran out.
-	// Zero leaves the player connected.
+	// EmptyQueueTimeout destroys an idle player after this long. Zero never does.
 	EmptyQueueTimeout time.Duration
-	// MaxTrackErrors stops a player after this many tracks failed in a row.
-	// Defaults to 3; negative never stops.
+	// MaxTrackErrors stops a player after this many failures in a row. Defaults
+	// to 3; negative never stops.
 	MaxTrackErrors int
 
-	// Resuming asks nodes to keep players alive for this long after the
-	// websocket drops. Zero disables it, so a drop stops the music.
+	// Resuming keeps players alive this long after a websocket drop. Zero
+	// disables it, so a drop stops the music.
 	Resuming time.Duration
-	// Heartbeat pings a node this often and drops the connection when two
-	// intervals pass without a pong. Zero trusts the socket.
+	// Heartbeat pings this often and drops the socket after two silent
+	// intervals. Zero trusts the socket.
 	Heartbeat time.Duration
-	// MaxReconnects is how many times a dropped node redials. Defaults to 10;
-	// negative retries forever.
+	// MaxReconnects redials this many times. Defaults to 10; negative is forever.
 	MaxReconnects int
-	// ReconnectDelay is the base delay between attempts, multiplied by the
-	// attempt number and capped at a minute. Defaults to 5s.
+	// ReconnectDelay grows with the attempt number, capped at a minute. Defaults
+	// to 5s.
 	ReconnectDelay time.Duration
 
-	// Crossfade overlaps tracks by pre-buffering the next one. Needs a Kairo
-	// node; stock Lavalink ignores it. [Player.SetCrossfade] overrides it for
-	// one player.
+	// Crossfade overlaps tracks by pre-buffering the next. Needs a Kairo node;
+	// [Player.SetCrossfade] overrides it per player.
 	Crossfade *lavalink.Crossfade
-	// Tape ramps pitch down on pause and up on resume. Needs a Kairo node.
-	// [Player.SetTape] overrides it for one player.
+	// Tape ramps pitch around a pause. Needs a Kairo node; [Player.SetTape]
+	// overrides it per player.
 	Tape *lavalink.Tape
 }
 

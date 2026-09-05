@@ -6,8 +6,7 @@ import (
 )
 
 // Filters is the audio filter chain a node applies to a player. A nil field is
-// left out of the payload, which turns that filter off on the node; send a
-// whole zero Filters to clear everything.
+// left out, which turns that filter off; a zero Filters clears everything.
 type Filters struct {
 	Volume     *float32    `json:"volume,omitzero"`
 	Equalizer  *Equalizer  `json:"equalizer,omitzero"`
@@ -20,15 +19,13 @@ type Filters struct {
 	ChannelMix *ChannelMix `json:"channelMix,omitzero"`
 	LowPass    *LowPass    `json:"lowPass,omitzero"`
 
-	// PluginFilters holds filters a node plugin registered, keyed by the name
-	// the plugin uses. See the Plugin* constants for the keys this package
-	// knows; values are marshalled as given, so any plugin works.
+	// PluginFilters holds a plugin's own filters, keyed by the name it uses; see
+	// the Plugin* constants. Values are marshalled as given, so any plugin works.
 	PluginFilters map[string]any `json:"pluginFilters,omitempty"`
 }
 
-// Active reports whether any filter is set, that is, whether the node is doing
-// DSP for this player. Seeking with filters on needs the node nudged twice, so
-// this is what that workaround keys off.
+// Active reports whether any filter is set, so whether the node is doing DSP.
+// Seeking with filters on needs the node nudged twice; this keys that.
 func (f Filters) Active() bool {
 	return f.Volume != nil || f.Equalizer != nil || f.Karaoke != nil ||
 		f.Timescale != nil || f.Tremolo != nil || f.Vibrato != nil ||
@@ -76,8 +73,8 @@ type Karaoke struct {
 	FilterWidth float32 `json:"filterWidth,omitzero"`
 }
 
-// Timescale changes speed, pitch and rate independently. 1.0 is untouched;
-// see [Nightcore] and [Vaporwave] for the two everyone asks for.
+// Timescale changes speed, pitch and rate independently, 1.0 untouched. See
+// [Nightcore] and [Vaporwave].
 type Timescale struct {
 	Speed float32 `json:"speed,omitzero"`
 	Pitch float32 `json:"pitch,omitzero"`
@@ -108,8 +105,8 @@ type Distortion struct {
 	Scale     float32 `json:"scale,omitzero"`
 }
 
-// ChannelMix remixes the stereo channels into each other. Zero is meaningful
-// here, so every field is always sent; use one of the Output* presets.
+// ChannelMix remixes the stereo channels. Zero is meaningful, so every field is
+// always sent; use an Output* preset.
 type ChannelMix struct {
 	LeftToLeft   float32 `json:"leftToLeft"`
 	LeftToRight  float32 `json:"leftToRight"`
@@ -128,8 +125,8 @@ const (
 	PluginLavaFilter = "lavalink-filter-plugin"
 	// PluginHighPass is LavaDSPX high-pass; value [PassFilter].
 	PluginHighPass = "high-pass"
-	// PluginLowPass is LavaDSPX low-pass; value [PassFilter]. Not the same as
-	// the stock [LowPass] filter.
+	// PluginLowPass is LavaDSPX low-pass; value [PassFilter]. Not the stock
+	// [LowPass].
 	PluginLowPass = "low-pass"
 	// PluginNormalization is LavaDSPX normalization; value [Normalization].
 	PluginNormalization = "normalization"
@@ -155,8 +152,8 @@ type Reverb struct {
 	Gains  []float32 `json:"gains,omitempty"`
 }
 
-// PassFilter is the LavaDSPX high-pass and low-pass payload. BoostFactor
-// changes the output volume, 1.0 leaves it alone.
+// PassFilter is the LavaDSPX high-pass and low-pass payload. BoostFactor 1.0
+// leaves the volume alone.
 type PassFilter struct {
 	CutoffFrequency int     `json:"cutoffFrequency,omitzero"`
 	BoostFactor     float32 `json:"boostFactor,omitzero"`
@@ -168,8 +165,8 @@ type Normalization struct {
 	Adaptive     bool    `json:"adaptive,omitzero"`
 }
 
-// DSPXEcho is the LavaDSPX echo payload; EchoLength is in seconds and Decay of
-// 1.0 means no decay. [Echo] is the lavalink-filter-plugin one.
+// DSPXEcho is the LavaDSPX echo payload: EchoLength in seconds, Decay 1.0 no
+// decay. [Echo] is the lavalink-filter-plugin one.
 type DSPXEcho struct {
 	EchoLength float32 `json:"echoLength,omitzero"`
 	Decay      float32 `json:"decay,omitzero"`

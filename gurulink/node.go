@@ -26,11 +26,10 @@ type NodeConfig struct {
 	Password string
 	// Secure switches to https and wss.
 	Secure bool
-	// SessionID resumes an earlier session of this node, so the players it
-	// still holds keep playing instead of being rebuilt.
+	// SessionID resumes an earlier session, keeping its players playing.
 	SessionID string
-	// Regions are the Discord voice regions this node should serve, matched
-	// against the endpoint a guild's voice server reports. Empty serves any.
+	// Regions are matched against the voice endpoint Discord reports. Empty
+	// serves any.
 	Regions []string
 }
 
@@ -58,8 +57,8 @@ func (s NodeStatus) String() string {
 	return "unknown"
 }
 
-// Node is one Lavalink server: a websocket for events and a REST API for
-// commands. Its methods are safe for concurrent use.
+// Node is one Lavalink server: a websocket for events, REST for commands. Safe
+// for concurrent use.
 type Node struct {
 	cfg    NodeConfig
 	client *Client
@@ -75,8 +74,7 @@ type Node struct {
 	stop      context.CancelFunc
 	attempts  int
 
-	// writeMu guards the few control frames we write; gorilla allows only one
-	// writer at a time.
+	// writeMu serialises writes; gorilla allows only one writer.
 	writeMu sync.Mutex
 }
 
@@ -110,19 +108,17 @@ func (n *Node) Stats() lavalink.Stats {
 	return n.stats
 }
 
-// Available reports whether the node can take requests: connected, with a
-// session id.
+// Available reports whether the node can take requests.
 func (n *Node) Available() bool {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.status == StatusConnected && n.sessionID != ""
 }
 
-// penalty scores how loaded the node is, so [Client.BestNode] can pick the
-// least busy one. Lower is better; an unavailable node scores the worst.
+// penalty scores load for [Client.BestNode]; lower is better, unavailable worst.
 //
-// ponytail: players plus CPU load, no frame-deficit term. Add one if you find
-// nodes that look idle while dropping frames.
+// ponytail: players plus CPU load, no frame-deficit term. Add one if nodes look
+// idle while dropping frames.
 func (n *Node) penalty() float64 {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
@@ -136,8 +132,7 @@ func (n *Node) penalty() float64 {
 	return float64(n.stats.PlayingPlayers) + load*10
 }
 
-// serves reports whether the node is configured for a voice region. The
-// endpoint Discord hands out looks like "us-east1234.discord.media".
+// serves matches a "us-east1234.discord.media" endpoint against the regions.
 func (n *Node) serves(endpoint string) bool {
 	if len(n.cfg.Regions) == 0 {
 		return true
@@ -154,9 +149,8 @@ func (n *Node) serves(endpoint string) bool {
 // maxReconnectDelay caps the backoff between reconnect attempts.
 const maxReconnectDelay = 60 * time.Second
 
-// Open dials the node's websocket and starts reading it. It returns as soon as
-// the connection is up; the handshake that follows arrives as a [ReadyEvent],
-// and only then can players be created.
+// Open dials the websocket and returns once it is up; the handshake follows as a
+// [ReadyEvent], and only then can players be created.
 func (n *Node) Open(ctx context.Context) error {
 	n.mu.Lock()
 	if n.status == StatusConnecting || n.status == StatusConnected {
@@ -175,8 +169,7 @@ func (n *Node) Open(ctx context.Context) error {
 		return err
 	}
 
-	// The read loop outlives the caller's context on purpose: Open is often
-	// called with a request-scoped one.
+	// The read loop outlives the caller's ctx, which is often request-scoped.
 	loopCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	n.mu.Lock()
 	n.conn, n.stop, n.status, n.attempts = conn, cancel, StatusConnected, 0
@@ -188,8 +181,7 @@ func (n *Node) Open(ctx context.Context) error {
 	return nil
 }
 
-// Close shuts the websocket down. Players stay put: with resuming on the node
-// keeps playing them until the timeout runs out.
+// Close shuts the websocket down. With resuming on the node keeps playing.
 func (n *Node) Close() {
 	n.mu.Lock()
 	conn, stop := n.conn, n.stop
@@ -231,8 +223,7 @@ func (n *Node) dial(ctx context.Context) (*websocket.Conn, error) {
 func (n *Node) listen(ctx context.Context, conn *websocket.Conn) {
 	defer conn.Close()
 
-	// A node that stops sending stats without closing the socket would leave
-	// every player silently stuck, so ping it and give up if no pong arrives.
+	// A socket that dies without closing leaves every player stuck, so ping it.
 	if hb := n.client.cfg.Heartbeat; hb > 0 {
 		deadline := func() error { return conn.SetReadDeadline(time.Now().Add(2 * hb)) }
 		_ = deadline()
@@ -246,7 +237,7 @@ func (n *Node) listen(ctx context.Context, conn *websocket.Conn) {
 			n.disconnected(err)
 			return
 		}
-		n.handle(data)
+		n.handle(ctx, data)
 	}
 }
 
@@ -273,9 +264,15 @@ func (n *Node) ping(ctx context.Context, conn *websocket.Conn, every time.Durati
 func (n *Node) disconnected(err error) {
 	n.mu.Lock()
 	expected := n.status == StatusClosing
+	stop := n.stop
 	n.status = StatusDisconnected
-	n.conn = nil
+	n.conn, n.stop = nil, nil
 	n.mu.Unlock()
+
+	// The read loop's work is bound to a connection that is gone.
+	if stop != nil {
+		stop()
+	}
 
 	code, reason := websocket.CloseAbnormalClosure, err.Error()
 	var closeErr *websocket.CloseError
@@ -324,8 +321,8 @@ func (n *Node) reconnect() {
 	}
 }
 
-// handle turns one gateway frame into events.
-func (n *Node) handle(data []byte) {
+// handle turns one frame into events. ctx is the read loop's.
+func (n *Node) handle(ctx context.Context, data []byte) {
 	var frame struct {
 		Op      lavalink.Op        `json:"op"`
 		Type    lavalink.EventType `json:"type"`
@@ -346,7 +343,7 @@ func (n *Node) handle(data []byte) {
 		n.sessionID = ready.SessionID
 		n.mu.Unlock()
 		n.client.emit(ready)
-		go n.afterReady(ready.Resumed)
+		go n.afterReady(ctx, ready.Resumed)
 
 	case lavalink.OpStats:
 		var stats lavalink.Stats
@@ -371,7 +368,7 @@ func (n *Node) handle(data []byte) {
 		n.client.emit(update)
 
 	case lavalink.OpEvent:
-		n.handleEvent(frame.Type, frame.GuildID, data)
+		n.handleEvent(ctx, frame.Type, frame.GuildID, data)
 
 	default:
 		n.client.emit(&UnknownEvent{Node: n, GuildID: frame.GuildID, Type: frame.Type, Data: data})
@@ -386,10 +383,11 @@ func (n *Node) decode(data []byte, out any) bool {
 	return true
 }
 
-// afterReady turns resuming on and puts our players back on the node. A resumed
-// session kept playing, so its players are reported instead of rebuilt.
-func (n *Node) afterReady(resumed bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// afterReady turns resuming on and puts our players back. A resumed session kept
+// playing, so its players are reported instead of rebuilt. ctx is the read
+// loop's, so a dropping socket stops the rebuilding.
+func (n *Node) afterReady(ctx context.Context, resumed bool) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	if timeout := n.client.cfg.Resuming; timeout > 0 {
@@ -399,8 +397,7 @@ func (n *Node) afterReady(resumed bool) {
 		}
 	}
 	if resumed {
-		// Whoever handles this needs to know what the node kept, and after a
-		// process restart we have no record of it.
+		// After a restart we have no record of what the node kept.
 		infos, err := n.PlayerInfos(ctx)
 		if err != nil {
 			n.client.emit(&ErrorEvent{Node: n, Err: fmt.Errorf("gurulink: list resumed players: %w", err)})
@@ -419,9 +416,9 @@ func (n *Node) afterReady(resumed bool) {
 	}
 }
 
-// handleEvent decodes an op:event frame. Listeners see it before the player
-// reacts, so a handler still sees the queue as it was when the event happened.
-func (n *Node) handleEvent(typ lavalink.EventType, guildID string, data []byte) {
+// handleEvent decodes an op:event. Listeners run before the player reacts, so
+// they still see the queue as it was.
+func (n *Node) handleEvent(ctx context.Context, typ lavalink.EventType, guildID string, data []byte) {
 	player := n.client.Player(guildID)
 	if player == nil {
 		n.log.Debug("gurulink: event for unknown player",
@@ -465,5 +462,5 @@ func (n *Node) handleEvent(typ lavalink.EventType, guildID string, data []byte) 
 		return
 	}
 	n.client.emit(event)
-	player.handle(event)
+	player.handle(ctx, event)
 }

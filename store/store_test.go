@@ -32,8 +32,8 @@ func TestFile(t *testing.T) {
 	}
 }
 
-// TestFileRejectsPaths is the trust boundary: guild ids come from Discord
-// payloads, so a crafted one must not reach outside Dir.
+// TestFileRejectsPaths is the trust boundary: guild ids come from Discord, so a
+// crafted one must not reach outside Dir.
 func TestFileRejectsPaths(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

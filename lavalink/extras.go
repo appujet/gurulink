@@ -14,12 +14,11 @@ const (
 	CrossfadeSCurve CrossfadeCurve = "sCurve"
 )
 
-// Crossfade overlaps the end of a track with the pre-buffered successor.
-// Zero-valued fields fall back to the node's defaults.
+// Crossfade overlaps the end of a track with the pre-buffered successor. A zero
+// field falls back to the node's default.
 type Crossfade struct {
 	Enable bool `json:"enable"`
-	// DurationMs is the overlap length, ManualDurationMs the one used for an
-	// explicit skip.
+	// ManualDurationMs is the overlap of an explicit skip.
 	DurationMs       int            `json:"durationMs,omitzero"`
 	ManualDurationMs int            `json:"manualDurationMs,omitzero"`
 	Curve            CrossfadeCurve `json:"curve,omitzero"`

@@ -2,7 +2,8 @@ package lavalink
 
 import "encoding/json"
 
-// PlayerState is the playback state a node reports every ~100ms.
+// PlayerState is the playback state a node reports every few seconds, as often
+// as its playerUpdateInterval says.
 type PlayerState struct {
 	Time      Timestamp `json:"time"`
 	Position  Duration  `json:"position"`
@@ -18,8 +19,8 @@ type VoiceState struct {
 	ChannelID string `json:"channelId"`
 }
 
-// Complete reports whether the state can be handed to a node. A node rejects the whole update when
-// any of the four is missing, channel id included.
+// Complete reports whether the state can be handed to a node, which rejects the
+// whole update when any of the four is missing, channel id included.
 func (v VoiceState) Complete() bool {
 	return v.Token != "" && v.Endpoint != "" && v.SessionID != "" && v.ChannelID != ""
 }
@@ -35,16 +36,15 @@ type PlayerInfo struct {
 	Filters Filters     `json:"filters"`
 }
 
-// UpdateTrack selects the track to play. Encoded may be set to null (see
-// [Null]) to stop playback, or left out to only touch the other fields.
+// UpdateTrack selects the track to play. A null Encoded (see [Null]) stops
+// playback; leaving it out touches only the other fields.
 type UpdateTrack struct {
 	Encoded    Nullable[string] `json:"encoded,omitzero"`
 	Identifier string           `json:"identifier,omitzero"`
 	UserData   json.RawMessage  `json:"userData,omitzero"`
 }
 
-// PlayerUpdate is a PATCH body for a player: every zero field is left untouched
-// by the node.
+// PlayerUpdate is a PATCH body for a player; every zero field is left untouched.
 type PlayerUpdate struct {
 	Track    *UpdateTrack `json:"track,omitzero"`
 	Position *Duration    `json:"position,omitzero"`
@@ -54,8 +54,7 @@ type PlayerUpdate struct {
 	Voice    *VoiceState  `json:"voice,omitzero"`
 	Filters  *Filters     `json:"filters,omitzero"`
 
-	// NextTrack, Crossfade, Tape and Transition need a Kairo node; stock
-	// Lavalink ignores unknown fields, so sending them is harmless.
+	// These four need a Kairo node; stock Lavalink ignores unknown fields.
 	NextTrack  Nullable[UpdateTrack] `json:"nextTrack,omitzero"`
 	Crossfade  Nullable[Crossfade]   `json:"crossfade,omitzero"`
 	Tape       Nullable[Tape]        `json:"tape,omitzero"`

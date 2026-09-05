@@ -44,8 +44,8 @@
 // [NodeRemovedEvent], and [ErrorEvent] for what had nowhere else to go.
 //
 // Playback: [TrackStartEvent], [TrackEndEvent], [TrackExceptionEvent],
-// [TrackStuckEvent], [TrackPromotedEvent], [PlayerUpdateEvent] every ~100ms,
-// [QueueEndEvent] when nothing follows, and [IdleStartEvent] with
+// [TrackStuckEvent], [TrackPromotedEvent], [PlayerUpdateEvent] every few
+// seconds, [QueueEndEvent] when nothing follows, and [IdleStartEvent] with
 // [IdleCancelEvent] around the [Config.EmptyQueueTimeout] countdown.
 //
 // The voice connection: [PlayerChannelMoveEvent], [PlayerNodeMoveEvent],

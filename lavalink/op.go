@@ -45,8 +45,7 @@ const (
 	ReasonReplaced   TrackEndReason = "replaced"
 	ReasonCleanup    TrackEndReason = "cleanup"
 
-	// ReasonCrossfade and ReasonGapless mean a pre-buffered successor already
-	// took over on the node, so no play request must follow.
+	// A pre-buffered successor already took over, so no play request must follow.
 	ReasonCrossfade TrackEndReason = "crossfade"
 	ReasonGapless   TrackEndReason = "gapless"
 )

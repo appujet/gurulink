@@ -12,8 +12,7 @@ import (
 	"github.com/appujet/gurulink/lavalink"
 )
 
-// Client owns the nodes and one [Player] per guild. Its methods are safe for
-// concurrent use.
+// Client owns the nodes and one [Player] per guild. Safe for concurrent use.
 type Client struct {
 	cfg  Config
 	done chan struct{}
@@ -34,6 +33,12 @@ func New(cfg Config) (*Client, error) {
 		return nil, errors.New("gurulink: Config.SendVoiceUpdate is required")
 	}
 	cfg = cfg.withDefaults()
+	// Once here: a typo fails at startup and an alias works where a prefix does.
+	source, ok := Source(cfg.DefaultSource)
+	if !ok {
+		return nil, fmt.Errorf("gurulink: unknown Config.DefaultSource %q", cfg.DefaultSource)
+	}
+	cfg.DefaultSource = source
 	return &Client{
 		cfg:       cfg,
 		done:      make(chan struct{}),
@@ -51,13 +56,13 @@ func (c *Client) Logger() *slog.Logger { return c.cfg.Logger }
 // AddListener registers listeners for every later event.
 func (c *Client) AddListener(listeners ...Listener) {
 	c.mu.Lock()
+	// Copy on write, so [Client.emit] walks the slice without the lock.
 	c.listeners = append(slices.Clone(c.listeners), listeners...)
 	c.mu.Unlock()
 }
 
-// emit hands one event to every listener, in order, on the caller's goroutine:
-// the node's read loop. A listener that blocks stalls that node, so hand slow
-// work to a goroutine of your own.
+// emit runs every listener in order on the caller's goroutine, the node's read
+// loop: a listener that blocks stalls the node.
 func (c *Client) emit(event Event) {
 	c.mu.RLock()
 	listeners := c.listeners
@@ -123,8 +128,7 @@ func (c *Client) Nodes() []*Node {
 	return slices.Clone(c.nodes)
 }
 
-// RemoveNode closes a node and moves its players elsewhere. Players with
-// nowhere to go are destroyed.
+// RemoveNode closes a node and moves its players; the homeless are destroyed.
 func (c *Client) RemoveNode(ctx context.Context, name string) error {
 	node := c.Node(name)
 	if node == nil {
@@ -140,7 +144,10 @@ func (c *Client) RemoveNode(ctx context.Context, name string) error {
 		}
 		target := c.BestNode()
 		if target == nil {
-			_ = player.Destroy(ctx, DestroyNodeGone)
+			if err := player.Destroy(ctx, DestroyNodeGone); err != nil {
+				c.cfg.Logger.Error("gurulink: destroy player of removed node",
+					slog.String("guild_id", player.GuildID()), slog.Any("err", err))
+			}
 			continue
 		}
 		if err := player.MoveNode(ctx, target); err != nil {
@@ -156,17 +163,16 @@ func (c *Client) RemoveNode(ctx context.Context, name string) error {
 // BestNode is the least loaded available node, or nil when none is up.
 func (c *Client) BestNode() *Node { return c.bestNode("") }
 
-// bestNode is the least loaded available node serving a voice endpoint. An
-// empty endpoint ignores regions; an endpoint no node claims falls back to the
-// regionless pick, since a node far away still beats no node.
+// bestNode is the least loaded node serving an endpoint. An empty one ignores
+// regions; an unclaimed one falls back, since a far node beats no node.
 func (c *Client) bestNode(endpoint string) *Node {
+	// Held throughout: penalty only takes the node's own lock.
 	c.mu.RLock()
-	nodes := slices.Clone(c.nodes)
-	c.mu.RUnlock()
+	defer c.mu.RUnlock()
 
 	var best, bestInRegion *Node
 	var bestScore, bestRegionScore float64
-	for _, node := range nodes {
+	for _, node := range c.nodes {
 		score := node.penalty()
 		if math.IsInf(score, 1) {
 			continue
@@ -202,9 +208,8 @@ func (c *Client) Players() []*Player {
 	return players
 }
 
-// NewPlayer returns the guild's player, creating it on the least loaded node if
-// it has none. It only sets up bookkeeping: join a voice channel with
-// [Player.Connect] and start playing with [Player.Play].
+// NewPlayer returns the guild's player, creating it on the least loaded node. It
+// only does bookkeeping: [Player.Connect], then [Player.Play].
 func (c *Client) NewPlayer(guildID string) (*Player, error) {
 	if guildID == "" {
 		return nil, errors.New("gurulink: guild id is required")
@@ -242,10 +247,9 @@ func (c *Client) forget(guildID string) {
 	c.mu.Unlock()
 }
 
-// Search resolves a user query on the least loaded node. source names a search
-// prefix ("spotify", "ytsearch", …) and may be empty to take
-// [Config.DefaultSource]; a query that carries its own prefix, or is a URL,
-// keeps it.
+// Search resolves a user query on the least loaded node. source is a prefix or
+// alias ("spotify", "yt"), empty for [Config.DefaultSource]; a prefix in the
+// query wins, and a URL is used as it is.
 func (c *Client) Search(ctx context.Context, query, source string) (lavalink.LoadResult, error) {
 	node := c.BestNode()
 	if node == nil {
@@ -262,9 +266,8 @@ func (c *Client) searchOn(ctx context.Context, node *Node, query, source string)
 	return node.LoadTracks(ctx, identifier)
 }
 
-// VoiceStateUpdate is Discord's VOICE_STATE_UPDATE, cut down to the fields
-// gurulink reads. Forward every one a guild sends, the bot's own and other
-// users': UserID is what tells them apart, and leaving it empty means the bot.
+// VoiceStateUpdate is Discord's VOICE_STATE_UPDATE, cut down. Forward every one
+// a guild sends; UserID tells other users apart, and empty means the bot.
 type VoiceStateUpdate struct {
 	GuildID string
 	// ChannelID is empty when the user left voice altogether.
@@ -279,9 +282,9 @@ type VoiceStateUpdate struct {
 	Suppress bool
 }
 
-// OnVoiceStateUpdate feeds Discord's VOICE_STATE_UPDATE in. For the bot itself
-// an empty ChannelID means it left, which destroys the player; another user's
-// update only turns into a [PlayerVoiceJoinEvent] or [PlayerVoiceLeaveEvent].
+// OnVoiceStateUpdate feeds Discord's VOICE_STATE_UPDATE in. An empty ChannelID
+// for the bot destroys the player; another user's only turns into a
+// [PlayerVoiceJoinEvent] or [PlayerVoiceLeaveEvent].
 func (c *Client) OnVoiceStateUpdate(ctx context.Context, update VoiceStateUpdate) error {
 	player := c.Player(update.GuildID)
 	if player == nil {
@@ -292,8 +295,7 @@ func (c *Client) OnVoiceStateUpdate(ctx context.Context, update VoiceStateUpdate
 		return nil
 	}
 	if update.ChannelID == "" {
-		// [Player.Disconnect] cleared the channel before Discord echoed the leave
-		// back, so an empty one here means we left on purpose and the player stays.
+		// [Player.Disconnect] already cleared the channel, so this leave is ours.
 		if player.ChannelID() == "" {
 			return nil
 		}
@@ -303,8 +305,8 @@ func (c *Client) OnVoiceStateUpdate(ctx context.Context, update VoiceStateUpdate
 	return player.onVoiceState(ctx, update)
 }
 
-// OnVoiceServerUpdate feeds Discord's VOICE_SERVER_UPDATE in. This is what
-// actually hands the voice connection to the node.
+// OnVoiceServerUpdate feeds Discord's VOICE_SERVER_UPDATE in; this is what hands
+// the voice connection to the node.
 func (c *Client) OnVoiceServerUpdate(ctx context.Context, guildID, token, endpoint string) error {
 	player := c.Player(guildID)
 	if player == nil {
@@ -313,10 +315,9 @@ func (c *Client) OnVoiceServerUpdate(ctx context.Context, guildID, token, endpoi
 	return player.onVoiceServer(ctx, token, endpoint)
 }
 
-// Close closes every node and stops reconnecting. Players are left alone: with
-// [Config.Resuming] set the nodes keep them playing until the timeout runs out,
-// so a restart can pick them back up with [NodeConfig.SessionID]. Destroy the
-// players first for a clean stop.
+// Close closes every node and stops reconnecting. With [Config.Resuming] the
+// nodes keep playing, so [NodeConfig.SessionID] can pick them back up; destroy
+// the players first for a clean stop.
 func (c *Client) Close() {
 	c.mu.Lock()
 	if c.closed {

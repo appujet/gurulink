@@ -15,13 +15,11 @@ import (
 	"github.com/appujet/gurulink/lavalink"
 )
 
-// ErrNoSession means the node's websocket has not handed out a session id yet,
-// so nothing player-scoped can be requested.
+// ErrNoSession means the node has no session id yet, so no player request works.
 var ErrNoSession = errors.New("gurulink: node has no session yet")
 
-// do sends one REST request and decodes the JSON reply into out, which may be
-// nil for endpoints that answer with nothing. A non-2xx reply becomes a
-// [lavalink.RESTError].
+// do sends one request and decodes the reply into out, which may be nil. A
+// non-2xx reply becomes a [lavalink.RESTError].
 func (n *Node) do(ctx context.Context, method, path string, body, out any) error {
 	var payload io.Reader
 	if body != nil {
@@ -99,16 +97,15 @@ func (n *Node) Info(ctx context.Context) (lavalink.Info, error) {
 	return info, err
 }
 
-// FetchStats asks the node for its load report. Stats also arrive unprompted
-// every minute; see [Node.Stats] for the last one.
+// FetchStats asks for a load report; [Node.Stats] has the last unprompted one.
 func (n *Node) FetchStats(ctx context.Context) (lavalink.Stats, error) {
 	var stats lavalink.Stats
 	err := n.do(ctx, http.MethodGet, "/v4/stats", nil, &stats)
 	return stats, err
 }
 
-// LoadTracks resolves an identifier: a URL, or "source:terms" for a search.
-// Use [Client.Search] to build one from a user query.
+// LoadTracks resolves a URL or "source:terms". [Client.Search] builds one from a
+// user query.
 func (n *Node) LoadTracks(ctx context.Context, identifier string) (lavalink.LoadResult, error) {
 	var result lavalink.LoadResult
 	err := n.do(ctx, http.MethodGet, "/v4/loadtracks?identifier="+url.QueryEscape(identifier), nil, &result)
@@ -116,7 +113,7 @@ func (n *Node) LoadTracks(ctx context.Context, identifier string) (lavalink.Load
 }
 
 // LoadSearch runs a LavaSearch query, optionally limited to some result kinds.
-// An empty result comes back as a zero [lavalink.LavaSearchResult], not an error.
+// Nothing found is a zero result, not an error.
 func (n *Node) LoadSearch(ctx context.Context, query string, types ...lavalink.LavaSearchType) (lavalink.LavaSearchResult, error) {
 	path := "/v4/loadsearch?query=" + url.QueryEscape(query)
 	if len(types) > 0 {
@@ -145,9 +142,8 @@ func (n *Node) DecodeTracks(ctx context.Context, encoded []string) ([]lavalink.T
 	return tracks, err
 }
 
-// UpdateSession turns resuming on or off. With resuming on, a node keeps its
-// players alive for the timeout after the websocket drops, so a reconnect picks
-// them back up instead of leaving everyone in silence.
+// UpdateSession turns resuming on or off: a node keeps its players alive for the
+// timeout after a drop, so a reconnect picks them back up.
 func (n *Node) UpdateSession(ctx context.Context, update lavalink.SessionUpdate) (lavalink.Session, error) {
 	prefix, err := n.session()
 	if err != nil {
@@ -181,7 +177,7 @@ func (n *Node) FetchPlayer(ctx context.Context, guildID string) (lavalink.Player
 }
 
 // UpdatePlayer patches a player, creating it if the guild has none. Only the
-// fields set in update are touched.
+// fields set in update change.
 func (n *Node) UpdatePlayer(ctx context.Context, guildID string, update lavalink.PlayerUpdate) (lavalink.PlayerInfo, error) {
 	path, err := n.playerPath(guildID)
 	if err != nil {
@@ -215,8 +211,8 @@ func (n *Node) SponsorBlockCategories(ctx context.Context, guildID string) ([]la
 	return categories, err
 }
 
-// SetSponsorBlockCategories replaces the categories to skip. Unknown categories
-// are rejected here rather than by the node.
+// SetSponsorBlockCategories replaces the categories to skip, rejecting unknown
+// ones before the node does.
 func (n *Node) SetSponsorBlockCategories(ctx context.Context, guildID string, categories []lavalink.SponsorBlockCategory) error {
 	for _, c := range categories {
 		if !c.Valid() {
@@ -239,8 +235,8 @@ func (n *Node) ClearSponsorBlockCategories(ctx context.Context, guildID string) 
 	return n.do(ctx, http.MethodDelete, path+"/sponsorblock/categories", nil, nil)
 }
 
-// TrackLyrics fetches the lyrics of whatever the player is playing.
-// skipTrackSource looks past the source's own lyrics provider.
+// TrackLyrics fetches the playing track's lyrics. skipTrackSource looks past the
+// source's own provider.
 func (n *Node) TrackLyrics(ctx context.Context, guildID string, skipTrackSource bool) (lavalink.Lyrics, error) {
 	path, err := n.playerPath(guildID)
 	if err != nil {
@@ -260,8 +256,7 @@ func (n *Node) Lyrics(ctx context.Context, encoded string, skipTrackSource bool)
 	return lyrics, err
 }
 
-// SubscribeLyrics asks the node to push [LyricsLineEvent]s as the current track
-// plays.
+// SubscribeLyrics asks the node to push [LyricsLineEvent]s as the track plays.
 func (n *Node) SubscribeLyrics(ctx context.Context, guildID string, skipTrackSource bool) error {
 	path, err := n.playerPath(guildID)
 	if err != nil {
@@ -279,8 +274,7 @@ func (n *Node) UnsubscribeLyrics(ctx context.Context, guildID string) error {
 	return n.do(ctx, http.MethodDelete, path+"/lyrics/subscribe", nil, nil)
 }
 
-// RoutePlannerStatus reports the node's IP rotation state. Details is nil when
-// no route planner is configured.
+// RoutePlannerStatus reports IP rotation state; Details is nil without a planner.
 func (n *Node) RoutePlannerStatus(ctx context.Context) (lavalink.RoutePlanner, error) {
 	var planner lavalink.RoutePlanner
 	err := n.do(ctx, http.MethodGet, "/v4/routeplanner/status", nil, &planner)
@@ -306,5 +300,6 @@ func (n *Node) playerPath(guildID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return prefix + "/players/" + guildID, nil
+	// Guild ids come from Discord payloads, so escape rather than trust them.
+	return prefix + "/players/" + url.PathEscape(guildID), nil
 }

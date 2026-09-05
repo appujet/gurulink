@@ -7,8 +7,7 @@ import (
 	"github.com/appujet/gurulink/gurulink"
 )
 
-// listeners is one handler per event gurulink can hand out, all 38 of them. A
-// real bot wants a handful of these; the rest is here to show what arrives.
+// listeners is one handler per event, all 38: a real bot wants a handful.
 func listeners() []gurulink.Listener {
 	return slices.Concat(nodeListeners(), playbackListeners(), voiceListeners(), pluginListeners())
 }
@@ -66,7 +65,7 @@ func playbackListeners() []gurulink.Listener {
 				slog.String("reason", string(e.Reason)))
 		}),
 		gurulink.On(func(e *gurulink.PlayerUpdateEvent) {
-			// Every ~100ms per player: too loud for anything but a progress bar.
+			// One per player every few seconds: only useful for a progress bar.
 			slog.Debug("player update", slog.String("guild", e.Player.GuildID()),
 				slog.String("position", e.State.Position.String()), slog.Int("ping", e.State.Ping))
 		}),
@@ -151,7 +150,7 @@ func voiceListeners() []gurulink.Listener {
 	}
 }
 
-// Plugin events only arrive from a node that runs the plugin behind them.
+// Plugin events need the node to run that plugin.
 func pluginListeners() []gurulink.Listener {
 	return []gurulink.Listener{
 		gurulink.On(func(e *gurulink.SegmentsLoadedEvent) {

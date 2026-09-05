@@ -10,8 +10,7 @@ import (
 )
 
 // Connect joins a voice channel, or moves to it. It only asks the Discord
-// gateway; the node gets the connection once Discord's two voice updates come
-// back through [Client.OnVoiceStateUpdate] and [Client.OnVoiceServerUpdate].
+// gateway; the node gets the connection once Discord's two voice updates arrive.
 func (p *Player) Connect(ctx context.Context, channelID string, selfMute, selfDeaf bool) error {
 	if channelID == "" {
 		return errors.New("gurulink: channel id is required")
@@ -22,7 +21,7 @@ func (p *Player) Connect(ctx context.Context, channelID string, selfMute, selfDe
 	return p.client.cfg.SendVoiceUpdate(ctx, p.guildID, &channelID, selfMute, selfDeaf)
 }
 
-// Disconnect leaves the voice channel but keeps the player and its queue, so
+// Disconnect leaves the channel but keeps the player and its queue, so
 // [Player.Connect] can pick things back up.
 func (p *Player) Disconnect(ctx context.Context) error {
 	p.mu.Lock()
@@ -36,9 +35,8 @@ func (p *Player) Disconnect(ctx context.Context) error {
 	return nil
 }
 
-// onVoiceState takes Discord's voice state for the bot. The node needs the session id and the
-// channel, and neither changes unless the voice session is rebuilt or the bot is moved. The rest
-// of the state only turns into events.
+// onVoiceState takes Discord's voice state for the bot. The node needs the
+// session id and the channel; the rest only turns into events.
 func (p *Player) onVoiceState(ctx context.Context, u VoiceStateUpdate) error {
 	p.mu.Lock()
 	from := p.channelID
@@ -73,9 +71,8 @@ func (p *Player) onVoiceState(ctx context.Context, u VoiceStateUpdate) error {
 	return p.update(ctx, lavalink.PlayerUpdate{Voice: &voice})
 }
 
-// otherVoiceState reports somebody else coming or going. Discord sends these for
-// every channel in the guild, so a leave is only as accurate as the channel the
-// update carries: see [PlayerVoiceLeaveEvent].
+// otherVoiceState reports somebody else coming or going; a leave is only as
+// accurate as the channel the update carries. See [PlayerVoiceLeaveEvent].
 func (p *Player) otherVoiceState(u VoiceStateUpdate) {
 	channelID := p.ChannelID()
 	if channelID == "" {
@@ -88,9 +85,9 @@ func (p *Player) otherVoiceState(u VoiceStateUpdate) {
 	p.client.emit(&PlayerVoiceLeaveEvent{Player: p, UserID: u.UserID})
 }
 
-// onVoiceServer takes Discord's voice server, which is what actually hands the
-// connection to a node. A node configured for another region gives the player up
-// to one that serves this endpoint.
+// onVoiceServer takes Discord's voice server, which hands the connection to a
+// node. A node serving another region gives the player up to one that serves this
+// endpoint.
 func (p *Player) onVoiceServer(ctx context.Context, token, endpoint string) error {
 	p.mu.Lock()
 	p.voice.Token, p.voice.Endpoint = token, endpoint
@@ -108,8 +105,8 @@ func (p *Player) onVoiceServer(ctx context.Context, token, endpoint string) erro
 	return p.update(ctx, lavalink.PlayerUpdate{Voice: &voice})
 }
 
-// Destroy tears the player down: it leaves the voice channel, drops the node's
-// player and forgets the stored queue. The player is unusable afterwards.
+// Destroy leaves the channel, drops the node's player and forgets the stored
+// queue. The player is unusable afterwards.
 func (p *Player) Destroy(ctx context.Context, reason DestroyReason) error {
 	p.mu.Lock()
 	if p.destroyed {
@@ -169,9 +166,8 @@ func (p *Player) MoveNode(ctx context.Context, node *Node) error {
 	return nil
 }
 
-// restore rebuilds this player on its node, at the position it had. A node
-// calls it after a reconnect it could not resume, and [Player.MoveNode] after a
-// move. Without a voice connection there is nothing to rebuild.
+// restore rebuilds this player on its node, at the position it had, after a
+// reconnect it could not resume or a move. No voice connection, nothing to do.
 func (p *Player) restore(ctx context.Context) error {
 	p.mu.RLock()
 	voice, volume, paused, filters := p.voice, p.volume, p.paused, p.filters

@@ -22,10 +22,12 @@ const (
 	Added    Change = "added"
 	Removed  Change = "removed"
 	Shuffled Change = "shuffled"
+	// Current is the playing track changing, queue untouched.
+	Current Change = "current"
 )
 
-// Store persists queues so they outlive a restart. Get returns nil data
-// for a guild it never saw. Implementations must be safe for concurrent use.
+// Store persists queues. Get returns nil for a guild it never saw;
+// implementations must be safe for concurrent use.
 type Store interface {
 	Get(ctx context.Context, guildID string) ([]byte, error)
 	Set(ctx context.Context, guildID string, data []byte) error
@@ -38,21 +40,21 @@ type Config struct {
 	Store Store
 	// Logger reports store failures. Defaults to [slog.Default].
 	Logger *slog.Logger
-	// OnChange is called after every change, outside the lock.
-	OnChange func(guildID string, change Change, tracks []lavalink.Track)
+	// OnChange runs after every change, outside the lock.
+	OnChange func(ctx context.Context, guildID string, change Change, tracks []lavalink.Track)
 	// HistoryLimit is how many played tracks to remember. Defaults to 25.
 	HistoryLimit int
 }
 
-// Queue is a player's track list. Every method is safe for concurrent use.
+// Queue is a player's track list. Safe for concurrent use.
 //
-// A change persists to [Config.Store] and calls [Config.OnChange] before
-// returning, both outside the lock.
+// A change writes to [Config.Store] and calls [Config.OnChange] before
+// returning, both outside the lock, which is what the context bounds.
 type Queue struct {
 	guildID  string
 	store    Store
 	log      *slog.Logger
-	onChange func(guildID string, change Change, tracks []lavalink.Track)
+	onChange func(ctx context.Context, guildID string, change Change, tracks []lavalink.Track)
 	limit    int
 
 	mu       sync.RWMutex
@@ -61,8 +63,7 @@ type Queue struct {
 	tracks   []lavalink.Track
 }
 
-// New builds an empty queue for a guild. Fill it from the store with
-// [Queue.Load].
+// New builds an empty queue. [Queue.Load] fills it from the store.
 func New(guildID string, cfg Config) *Queue {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -123,23 +124,23 @@ func (q *Queue) Duration() lavalink.Duration {
 }
 
 // Add appends tracks to the end of the queue.
-func (q *Queue) Add(tracks ...lavalink.Track) {
+func (q *Queue) Add(ctx context.Context, tracks ...lavalink.Track) {
 	if len(tracks) == 0 {
 		return
 	}
 	q.mu.Lock()
 	q.tracks = append(q.tracks, tracks...)
 	q.mu.Unlock()
-	q.changed(Added, tracks)
+	q.changed(ctx, Added, tracks)
 }
 
 // AddNext puts tracks at the front, so they play before everything queued.
-func (q *Queue) AddNext(tracks ...lavalink.Track) {
-	q.Insert(0, tracks...)
+func (q *Queue) AddNext(ctx context.Context, tracks ...lavalink.Track) {
+	q.Insert(ctx, 0, tracks...)
 }
 
 // Insert puts tracks at index i, clamped to the queue bounds.
-func (q *Queue) Insert(i int, tracks ...lavalink.Track) {
+func (q *Queue) Insert(ctx context.Context, i int, tracks ...lavalink.Track) {
 	if len(tracks) == 0 {
 		return
 	}
@@ -147,12 +148,12 @@ func (q *Queue) Insert(i int, tracks ...lavalink.Track) {
 	i = min(max(i, 0), len(q.tracks))
 	q.tracks = slices.Insert(q.tracks, i, tracks...)
 	q.mu.Unlock()
-	q.changed(Added, tracks)
+	q.changed(ctx, Added, tracks)
 }
 
 // Remove drops the track at index i and returns it.
-func (q *Queue) Remove(i int) (lavalink.Track, bool) {
-	removed, ok := q.RemoveRange(i, i+1)
+func (q *Queue) Remove(ctx context.Context, i int) (lavalink.Track, bool) {
+	removed, ok := q.RemoveRange(ctx, i, i+1)
 	if !ok {
 		return lavalink.Track{}, false
 	}
@@ -160,7 +161,7 @@ func (q *Queue) Remove(i int) (lavalink.Track, bool) {
 }
 
 // RemoveRange drops tracks in [start, end) and returns them.
-func (q *Queue) RemoveRange(start, end int) ([]lavalink.Track, bool) {
+func (q *Queue) RemoveRange(ctx context.Context, start, end int) ([]lavalink.Track, bool) {
 	q.mu.Lock()
 	if start < 0 || end > len(q.tracks) || start >= end {
 		q.mu.Unlock()
@@ -169,29 +170,35 @@ func (q *Queue) RemoveRange(start, end int) ([]lavalink.Track, bool) {
 	removed := slices.Clone(q.tracks[start:end])
 	q.tracks = slices.Delete(q.tracks, start, end)
 	q.mu.Unlock()
-	q.changed(Removed, removed)
+	q.changed(ctx, Removed, removed)
 	return removed, true
 }
 
 // Clear drops every waiting track, leaving the playing one alone.
-func (q *Queue) Clear() {
+func (q *Queue) Clear(ctx context.Context) {
 	q.mu.Lock()
 	removed := q.tracks
 	q.tracks = nil
 	q.mu.Unlock()
-	q.changed(Removed, removed)
+	if len(removed) > 0 {
+		q.changed(ctx, Removed, removed)
+	}
 }
 
 // Shuffle reorders the waiting tracks.
-func (q *Queue) Shuffle() {
+func (q *Queue) Shuffle(ctx context.Context) {
 	q.mu.Lock()
+	if len(q.tracks) < 2 {
+		q.mu.Unlock()
+		return
+	}
 	rand.Shuffle(len(q.tracks), func(i, j int) { q.tracks[i], q.tracks[j] = q.tracks[j], q.tracks[i] })
 	q.mu.Unlock()
-	q.changed(Shuffled, nil)
+	q.changed(ctx, Shuffled, nil)
 }
 
 // Move moves the track at from to index to.
-func (q *Queue) Move(from, to int) error {
+func (q *Queue) Move(ctx context.Context, from, to int) error {
 	q.mu.Lock()
 	if from < 0 || from >= len(q.tracks) || to < 0 || to >= len(q.tracks) {
 		q.mu.Unlock()
@@ -200,23 +207,25 @@ func (q *Queue) Move(from, to int) error {
 	track := q.tracks[from]
 	q.tracks = slices.Insert(slices.Delete(q.tracks, from, from+1), to, track)
 	q.mu.Unlock()
-	q.changed(Added, nil)
+	q.changed(ctx, Shuffled, nil)
 	return nil
 }
 
 // Swap exchanges two waiting tracks.
-func (q *Queue) Swap(i, j int) error {
+func (q *Queue) Swap(ctx context.Context, i, j int) error {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	if i < 0 || i >= len(q.tracks) || j < 0 || j >= len(q.tracks) {
+		q.mu.Unlock()
 		return fmt.Errorf("queue: swap %d<->%d out of range (%d tracks)", i, j, len(q.tracks))
 	}
 	q.tracks[i], q.tracks[j] = q.tracks[j], q.tracks[i]
+	q.mu.Unlock()
+	q.changed(ctx, Shuffled, nil)
 	return nil
 }
 
 // Filter keeps only the waiting tracks keep returns true for.
-func (q *Queue) Filter(keep func(lavalink.Track) bool) {
+func (q *Queue) Filter(ctx context.Context, keep func(lavalink.Track) bool) {
 	q.mu.Lock()
 	kept := make([]lavalink.Track, 0, len(q.tracks))
 	var removed []lavalink.Track
@@ -230,12 +239,11 @@ func (q *Queue) Filter(keep func(lavalink.Track) bool) {
 	q.tracks = kept
 	q.mu.Unlock()
 	if len(removed) > 0 {
-		q.changed(Removed, removed)
+		q.changed(ctx, Removed, removed)
 	}
 }
 
-// Find returns the index of the first waiting track match returns true for, or
-// -1. Pair it with [Queue.Remove] to drop a track a user picked out.
+// Find is the index of the first waiting track match returns true for, or -1.
 func (q *Queue) Find(match func(lavalink.Track) bool) int {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
@@ -252,28 +260,29 @@ func (q *Queue) Peek() (lavalink.Track, bool) {
 	return q.tracks[0], true
 }
 
-// Advance retires the playing track and makes the next one current. It reports
-// false when nothing was queued, which also clears Current.
-func (q *Queue) Advance() (lavalink.Track, bool) {
+// Advance retires the playing track and makes the next one current. Nothing
+// queued reports false and clears Current.
+func (q *Queue) Advance(ctx context.Context) (lavalink.Track, bool) {
 	q.mu.Lock()
-	q.retire()
+	retired := q.retire()
 	if len(q.tracks) == 0 {
 		q.current = nil
 		q.mu.Unlock()
-		q.changed(Removed, nil)
+		if retired {
+			q.changed(ctx, Removed, nil)
+		}
 		return lavalink.Track{}, false
 	}
 	next := q.tracks[0]
 	q.tracks = slices.Delete(q.tracks, 0, 1)
 	q.current = &next
 	q.mu.Unlock()
-	q.changed(Removed, []lavalink.Track{next})
+	q.changed(ctx, Removed, []lavalink.Track{next})
 	return next, true
 }
 
-// Back makes the last played track current again and puts the one playing back
-// at the front of the queue.
-func (q *Queue) Back() (lavalink.Track, bool) {
+// Back replays the last played track, pushing the playing one to the front.
+func (q *Queue) Back(ctx context.Context) (lavalink.Track, bool) {
 	q.mu.Lock()
 	if len(q.previous) == 0 {
 		q.mu.Unlock()
@@ -286,27 +295,38 @@ func (q *Queue) Back() (lavalink.Track, bool) {
 	}
 	q.current = &prev
 	q.mu.Unlock()
-	q.changed(Added, nil)
+	q.changed(ctx, Added, nil)
 	return prev, true
 }
 
-// SetCurrent replaces the playing track without touching the history.
-func (q *Queue) SetCurrent(t *lavalink.Track) {
+// SetCurrent replaces the playing track without touching the history. It copies:
+// callers pass tracks out of events listeners still hold.
+func (q *Queue) SetCurrent(ctx context.Context, t *lavalink.Track) {
 	q.mu.Lock()
+	// Advance already made it current and play sets it again: one write, not two.
+	if q.current == t || (q.current != nil && t != nil && q.current.Encoded == t.Encoded) {
+		q.mu.Unlock()
+		return
+	}
+	if t != nil {
+		track := *t
+		t = &track
+	}
 	q.current = t
 	q.mu.Unlock()
-	q.changed(Added, nil)
+	q.changed(ctx, Current, nil)
 }
 
 // retire moves the playing track into the history. Caller holds the lock.
-func (q *Queue) retire() {
+func (q *Queue) retire() bool {
 	if q.current == nil {
-		return
+		return false
 	}
 	q.previous = slices.Insert(q.previous, 0, *q.current)
 	if len(q.previous) > q.limit {
 		q.previous = q.previous[:q.limit]
 	}
+	return true
 }
 
 // state is what a [Store] holds per guild.
@@ -330,8 +350,7 @@ func (q *Queue) Save(ctx context.Context) error {
 	return q.store.Set(ctx, q.guildID, data)
 }
 
-// Load replaces the queue with whatever the store holds. A guild the store
-// never saw is not an error.
+// Load replaces the queue from the store. An unseen guild is not an error.
 func (q *Queue) Load(ctx context.Context) error {
 	if q.store == nil {
 		return nil
@@ -353,8 +372,7 @@ func (q *Queue) Load(ctx context.Context) error {
 	return nil
 }
 
-// Delete drops the stored copy of the queue, leaving the queue in memory alone.
-// Without a store it does nothing.
+// Delete drops the stored copy, leaving the one in memory alone.
 func (q *Queue) Delete(ctx context.Context) error {
 	if q.store == nil {
 		return nil
@@ -362,19 +380,18 @@ func (q *Queue) Delete(ctx context.Context) error {
 	return q.store.Delete(ctx, q.guildID)
 }
 
-// changed persists the queue and tells [Config.OnChange]. Call it with no
-// lock held.
+// changed persists the queue and tells [Config.OnChange]. Call with no lock held.
 //
-// ponytail: saves on every change, blocking. Wrap the store in a debouncing one
-// if that turns out to be too much write traffic.
-func (q *Queue) changed(change Change, tracks []lavalink.Track) {
+// ponytail: saves on every change, blocking. Wrap the store to debounce.
+func (q *Queue) changed(ctx context.Context, change Change, tracks []lavalink.Track) {
 	if q.onChange != nil {
-		q.onChange(q.guildID, change, tracks)
+		q.onChange(ctx, q.guildID, change, tracks)
 	}
 	if q.store == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Capped: a store that hangs must not hold up a command.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := q.Save(ctx); err != nil {
 		q.log.Error("queue: save", slog.String("guild_id", q.guildID), slog.Any("err", err))

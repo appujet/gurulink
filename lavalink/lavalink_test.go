@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-// TestNullable pins the tri-state the wire format needs: an untouched field is
-// absent, Null clears it on the node, Value sets it.
+// TestNullable pins the tri-state: absent leaves a field alone, Null clears it,
+// Value sets it.
 func TestNullable(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -39,8 +39,8 @@ func TestNullable(t *testing.T) {
 	}
 }
 
-// TestEqualizer checks the band/gain shape a node expects, since the Go side is
-// a plain array.
+// TestEqualizer checks the band/gain shape a node expects, since Go's side is a
+// plain array.
 func TestEqualizer(t *testing.T) {
 	data, err := json.Marshal(Filters{Equalizer: &Equalizer{0: 0.25, 14: -0.25}})
 	if err != nil {
@@ -69,8 +69,7 @@ func TestEqualizer(t *testing.T) {
 	}
 }
 
-// TestLoadResult covers all five load types, since each one puts its payload in
-// a different field.
+// TestLoadResult covers all five load types, each with its payload elsewhere.
 func TestLoadResult(t *testing.T) {
 	for _, tc := range []struct {
 		body   string
@@ -107,8 +106,8 @@ func TestLoadResult(t *testing.T) {
 	}
 }
 
-// A node rejects the whole player update when any of the four voice fields is missing, so an
-// incomplete state must never be sent — channel id included.
+// A node rejects the whole update when any of the four voice fields is missing,
+// channel id included.
 func TestVoiceStateComplete(t *testing.T) {
 	full := VoiceState{Token: "t", Endpoint: "e", SessionID: "s", ChannelID: "c"}
 	if !full.Complete() {

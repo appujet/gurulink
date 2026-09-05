@@ -44,9 +44,8 @@ func (t *Timestamp) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Nullable tells "field absent" apart from "field is null", which Lavalink needs
-// for a few update fields: absent means "leave it alone", null means "clear it".
-// Always tag the field `json:",omitzero"` so the zero value is left out.
+// Nullable tells an absent field ("leave it alone") from a null one ("clear it").
+// Tag the field `json:",omitzero"` so the zero value is left out.
 type Nullable[T any] struct {
 	set bool
 	val *T
@@ -67,8 +66,7 @@ func (n Nullable[T]) Get() (T, bool) {
 	return *n.val, true
 }
 
-// IsZero reports whether the field must be omitted. Used by encoding/json's
-// omitzero.
+// IsZero is encoding/json's omitzero hook.
 func (n Nullable[T]) IsZero() bool { return !n.set }
 
 func (n Nullable[T]) MarshalJSON() ([]byte, error) { return json.Marshal(n.val) }

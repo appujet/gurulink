@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/appujet/gurulink/lavalink"
@@ -26,8 +30,24 @@ func testClient(t *testing.T, edit func(*Config)) *Client {
 	return client
 }
 
-// TestIdentifier is the trust boundary: user queries turn into node identifiers
-// here.
+// testNode gives a client a node whose REST API is an httptest server, so player
+// commands land in bodies.
+func testNode(t *testing.T, client *Client, bodies chan<- []byte) *Node {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		bodies <- body
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"guildId":"g","volume":100}`)
+	}))
+	t.Cleanup(server.Close)
+	return &Node{cfg: NodeConfig{Name: "test"}, client: client, log: client.Logger(), rest: server.URL, sessionID: "s"}
+}
+
+// TestIdentifier is the trust boundary: user queries become node identifiers here.
 func TestIdentifier(t *testing.T) {
 	client := testClient(t, nil)
 	for _, tc := range []struct{ query, source, want string }{
@@ -37,6 +57,8 @@ func TestIdentifier(t *testing.T) {
 		{"never gonna", "YouTube", "ytsearch:never gonna"},
 		{"ytsearch:never gonna", "", "ytsearch:never gonna"},
 		{"ytsearch:never gonna", "spotify", "ytsearch:never gonna"},
+		{"yt:never gonna", "", "ytsearch:never gonna"},
+		{"yt:  never gonna", "spotify", "ytsearch:never gonna"},
 		{"https://youtu.be/x", "", "https://youtu.be/x"},
 		{"https://youtu.be/x", "spotify", "https://youtu.be/x"},
 	} {
@@ -61,17 +83,19 @@ func TestIdentifier(t *testing.T) {
 	if _, err := client.identifier(string(long), "speak"); !errors.Is(err, ErrSpeakQueryTooLong) {
 		t.Errorf("long speak query: %v", err)
 	}
+	if _, err := client.identifier("speak:"+string(long), ""); !errors.Is(err, ErrSpeakQueryTooLong) {
+		t.Errorf("long speak query naming its own source: %v", err)
+	}
 }
 
-// TestVoiceStateEvents covers the voice-state fan-out: one Discord update turns
-// into the channel, mute, deaf and suppress events, another user's update into
-// join/leave, and our own leave must not destroy the player while a kick must.
+// TestVoiceStateEvents covers the voice-state fan-out, and that our own leave
+// keeps the player while a kick destroys it.
 func TestVoiceStateEvents(t *testing.T) {
 	var seen []string
 	client := testClient(t, func(c *Config) {
 		c.Listeners = []Listener{func(e Event) { seen = append(seen, fmt.Sprintf("%T", e)) }}
 	})
-	// A player with a session-less node: every event fires, no request is sent.
+	// A session-less node: every event fires, no request is sent.
 	player := newPlayer(client, &Node{cfg: NodeConfig{Name: "test"}, client: client, log: client.Logger()}, "g")
 	client.players["g"] = player
 
@@ -133,10 +157,18 @@ func TestNewValidates(t *testing.T) {
 	if _, err := New(Config{UserID: "1"}); err == nil {
 		t.Error("a client needs SendVoiceUpdate")
 	}
+	send := func(context.Context, string, *string, bool, bool) error { return nil }
+	if _, err := New(Config{UserID: "1", SendVoiceUpdate: send, DefaultSource: "myspace"}); err == nil {
+		t.Error("an unknown default source should fail here, not on every search")
+	}
+	client, err := New(Config{UserID: "1", SendVoiceUpdate: send, DefaultSource: "youtube"})
+	if err != nil || client.Config().DefaultSource != "ytsearch" {
+		t.Errorf("an alias should resolve to its prefix: %v", err)
+	}
 }
 
-// TestPlayerOverrides covers the fallback chain of the Kairo settings: a
-// player's own beats the client-wide one, and clearing it goes back.
+// TestPlayerOverrides covers the Kairo fallback chain: a player's own setting
+// beats the client-wide one, and clearing it goes back.
 func TestPlayerOverrides(t *testing.T) {
 	client := testClient(t, func(c *Config) {
 		c.Crossfade = &lavalink.Crossfade{Enable: true}
@@ -161,5 +193,45 @@ func TestPlayerOverrides(t *testing.T) {
 	_ = player.SetTape(ctx, nil)
 	if !player.crossfading() || !taping() {
 		t.Error("clearing the overrides should fall back to the client")
+	}
+}
+
+// TestSkipCrossfade covers the manual skip: with crossfade on the request asks
+// for a transition and the queue waits for TrackPromotedEvent.
+func TestSkipCrossfade(t *testing.T) {
+	client := testClient(t, func(c *Config) { c.Crossfade = &lavalink.Crossfade{Enable: true} })
+	bodies := make(chan []byte, 4)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "playing"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "next"})
+
+	if err := player.Skip(ctx); err != nil {
+		t.Fatal(err)
+	}
+	body := string(<-bodies)
+	for _, want := range []string{`"transition":true`, `"nextTrack":{"encoded":"next"}`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the skip request %s is missing %s", body, want)
+		}
+	}
+	if strings.Contains(body, `"track":`) {
+		t.Errorf("the skip request %s replaces the track instead of fading into it", body)
+	}
+	if current := player.queue.Current(); current == nil || current.Encoded != "playing" {
+		t.Errorf("the queue moved before the node promoted the track: %v", current)
+	}
+
+	// Crossfade off: the same skip has to replace the track itself.
+	if err := player.SetCrossfade(ctx, &lavalink.Crossfade{}); err != nil {
+		t.Fatal(err)
+	}
+	<-bodies // SetCrossfade's own request.
+	if err := player.Skip(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if body := string(<-bodies); !strings.Contains(body, `"track":{"encoded":"next"}`) {
+		t.Errorf("the skip request %s does not play the next track", body)
 	}
 }

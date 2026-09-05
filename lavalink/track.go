@@ -28,8 +28,8 @@ type TrackInfo struct {
 	SourceName string   `json:"sourceName"`
 }
 
-// WithUserData returns a copy of t carrying data as its user data. Lavalink
-// echoes user data back on every event, so it is the place for a requester.
+// WithUserData returns a copy of t carrying data. Lavalink echoes user data back
+// on every event, so it is the place for a requester.
 func (t Track) WithUserData(data any) (Track, error) {
 	raw, err := json.Marshal(data)
 	if err != nil {
@@ -80,8 +80,8 @@ const (
 	LoadTypeError    LoadType = "error"
 )
 
-// LoadResult is what /loadtracks returned. Exactly one payload field is set,
-// picked by LoadType; use [LoadResult.AllTracks] if you only want the tracks.
+// LoadResult is what /loadtracks returned: LoadType picks the one payload field
+// that is set. [LoadResult.AllTracks] skips the switch.
 type LoadResult struct {
 	LoadType  LoadType
 	Track     *Track
