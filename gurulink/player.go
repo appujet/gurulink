@@ -77,6 +77,8 @@ type Player struct {
 	paused     bool
 	filters    lavalink.Filters
 	repeat     RepeatMode
+	crossfade  *lavalink.Crossfade
+	tape       *lavalink.Tape
 	errors     int
 	idleTimer  *time.Timer
 	destroyed  bool
@@ -274,11 +276,11 @@ func (p *Player) Stop(ctx context.Context) error {
 	return p.update(ctx, lavalink.PlayerUpdate{Track: &lavalink.UpdateTrack{Encoded: lavalink.Null[string]()}})
 }
 
-// Pause pauses or resumes playback. With [Config.Tape] set the node ramps the
-// pitch down and up around it.
+// Pause pauses or resumes playback. With a tape set the node ramps the pitch
+// down and up around it; see [Player.SetTape].
 func (p *Player) Pause(ctx context.Context, pause bool) error {
 	update := lavalink.PlayerUpdate{Paused: &pause}
-	if tape := p.client.cfg.Tape; tape != nil {
+	if tape := p.Tape(); tape != nil {
 		update.Tape = lavalink.Value(*tape)
 	}
 	was := p.Paused()
@@ -379,12 +381,67 @@ func (p *Player) next(ctx context.Context, reason lavalink.TrackEndReason) error
 	return p.update(ctx, lavalink.PlayerUpdate{Track: &lavalink.UpdateTrack{Encoded: lavalink.Null[string]()}})
 }
 
+// Crossfade is the crossfade this player runs with: its own if
+// [Player.SetCrossfade] gave it one, otherwise [Config.Crossfade].
+func (p *Player) Crossfade() *lavalink.Crossfade {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.crossfade != nil {
+		return p.crossfade
+	}
+	return p.client.cfg.Crossfade
+}
+
+// SetCrossfade overrides [Config.Crossfade] for this player and tells the node
+// straight away: nil goes back to the client-wide setting, and one with Enable
+// false turns crossfading off here. Needs a Kairo node.
+func (p *Player) SetCrossfade(ctx context.Context, crossfade *lavalink.Crossfade) error {
+	p.mu.Lock()
+	p.crossfade = crossfade
+	p.mu.Unlock()
+
+	if p.crossfading() {
+		return p.PreBuffer(ctx)
+	}
+	// Off: drop the successor too, so the node has nothing left to fade into.
+	return p.update(ctx, lavalink.PlayerUpdate{
+		Crossfade: lavalink.Null[lavalink.Crossfade](),
+		NextTrack: lavalink.Null[lavalink.UpdateTrack](),
+	})
+}
+
+// Tape is the tape this player runs with: its own if [Player.SetTape] gave it
+// one, otherwise [Config.Tape].
+func (p *Player) Tape() *lavalink.Tape {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.tape != nil {
+		return p.tape
+	}
+	return p.client.cfg.Tape
+}
+
+// SetTape overrides [Config.Tape] for this player: nil goes back to the
+// client-wide setting, and one with Enable false makes pausing instant again.
+// Needs a Kairo node.
+func (p *Player) SetTape(ctx context.Context, tape *lavalink.Tape) error {
+	p.mu.Lock()
+	p.tape = tape
+	p.mu.Unlock()
+
+	update := lavalink.PlayerUpdate{Tape: lavalink.Null[lavalink.Tape]()}
+	if effective := p.Tape(); effective != nil && effective.Enable {
+		update.Tape = lavalink.Value(*effective)
+	}
+	return p.update(ctx, update)
+}
+
 // PreBuffer tells the node which track follows the current one so it can
 // overlap them. The player does this on every track start; call it again after
 // editing the queue to have the change affect the pending crossfade. Needs
-// [Config.Crossfade] and a Kairo node.
+// [Player.Crossfade] to be enabled and a Kairo node.
 func (p *Player) PreBuffer(ctx context.Context) error {
-	crossfade := p.client.cfg.Crossfade
+	crossfade := p.Crossfade()
 	if crossfade == nil || !crossfade.Enable {
 		return nil
 	}

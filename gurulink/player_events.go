@@ -165,7 +165,7 @@ func (p *Player) voiceClosed(code int) {
 
 // crossfading reports whether the node should pre-buffer successors.
 func (p *Player) crossfading() bool {
-	crossfade := p.client.cfg.Crossfade
+	crossfade := p.Crossfade()
 	return crossfade != nil && crossfade.Enable
 }
 

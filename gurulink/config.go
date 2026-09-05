@@ -63,9 +63,11 @@ type Config struct {
 	ReconnectDelay time.Duration
 
 	// Crossfade overlaps tracks by pre-buffering the next one. Needs a Kairo
-	// node; stock Lavalink ignores it.
+	// node; stock Lavalink ignores it. [Player.SetCrossfade] overrides it for
+	// one player.
 	Crossfade *lavalink.Crossfade
 	// Tape ramps pitch down on pause and up on resume. Needs a Kairo node.
+	// [Player.SetTape] overrides it for one player.
 	Tape *lavalink.Tape
 }
 

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+
+	"github.com/appujet/gurulink/lavalink"
 )
 
 func testClient(t *testing.T, edit func(*Config)) *Client {
@@ -130,5 +132,34 @@ func TestNewValidates(t *testing.T) {
 	}
 	if _, err := New(Config{UserID: "1"}); err == nil {
 		t.Error("a client needs SendVoiceUpdate")
+	}
+}
+
+// TestPlayerOverrides covers the fallback chain of the Kairo settings: a
+// player's own beats the client-wide one, and clearing it goes back.
+func TestPlayerOverrides(t *testing.T) {
+	client := testClient(t, func(c *Config) {
+		c.Crossfade = &lavalink.Crossfade{Enable: true}
+		c.Tape = &lavalink.Tape{Enable: true}
+	})
+	player := newPlayer(client, &Node{cfg: NodeConfig{Name: "test"}, client: client, log: client.Logger()}, "g")
+	ctx := context.Background()
+	taping := func() bool { tape := player.Tape(); return tape != nil && tape.Enable }
+
+	if !player.crossfading() || !taping() {
+		t.Fatal("the client-wide settings should apply")
+	}
+
+	// The node has no session, so the requests fail; the overrides are set anyway.
+	_ = player.SetCrossfade(ctx, &lavalink.Crossfade{})
+	_ = player.SetTape(ctx, &lavalink.Tape{})
+	if player.crossfading() || taping() {
+		t.Error("the player's own settings should win")
+	}
+
+	_ = player.SetCrossfade(ctx, nil)
+	_ = player.SetTape(ctx, nil)
+	if !player.crossfading() || !taping() {
+		t.Error("clearing the overrides should fall back to the client")
 	}
 }
