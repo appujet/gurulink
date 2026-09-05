@@ -181,8 +181,9 @@ func (n *Node) Open(ctx context.Context) error {
 	return nil
 }
 
-// Close shuts the websocket down. With resuming on the node keeps playing.
-func (n *Node) Close() {
+// Close shuts the websocket down. With resuming on the node keeps playing. ctx
+// bounds the goodbye frame only; the socket closes either way.
+func (n *Node) Close(ctx context.Context) {
 	n.mu.Lock()
 	conn, stop := n.conn, n.stop
 	n.status = StatusClosing
@@ -194,10 +195,17 @@ func (n *Node) Close() {
 	if conn == nil {
 		return
 	}
-	n.writeMu.Lock()
-	_ = conn.WriteControl(websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
-	n.writeMu.Unlock()
+	// A shutdown that is already out of time skips the goodbye and just hangs up.
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(time.Second)
+	}
+	if ctx.Err() == nil {
+		n.writeMu.Lock()
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+		n.writeMu.Unlock()
+	}
 	_ = conn.Close()
 }
 

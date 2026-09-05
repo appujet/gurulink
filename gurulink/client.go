@@ -155,7 +155,7 @@ func (c *Client) RemoveNode(ctx context.Context, name string) error {
 				slog.String("guild_id", player.GuildID()), slog.Any("err", err))
 		}
 	}
-	node.Close()
+	node.Close(ctx)
 	c.emit(&NodeRemovedEvent{Node: node})
 	return nil
 }
@@ -317,8 +317,8 @@ func (c *Client) OnVoiceServerUpdate(ctx context.Context, guildID, token, endpoi
 
 // Close closes every node and stops reconnecting. With [Config.Resuming] the
 // nodes keep playing, so [NodeConfig.SessionID] can pick them back up; destroy
-// the players first for a clean stop.
-func (c *Client) Close() {
+// the players first for a clean stop. ctx bounds the whole shutdown.
+func (c *Client) Close(ctx context.Context) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -330,7 +330,7 @@ func (c *Client) Close() {
 	c.mu.Unlock()
 
 	for _, node := range nodes {
-		node.Close()
+		node.Close(ctx)
 	}
 }
 

@@ -94,7 +94,12 @@ func main() {
 		slog.Error("build gurulink client", slog.Any("err", err))
 		return
 	}
-	defer link.Close()
+	// The timeout has to start at shutdown, so build the context in the defer.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		link.Close(ctx)
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

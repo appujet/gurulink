@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/appujet/gurulink/lavalink"
+	"github.com/gorilla/websocket"
 )
 
 func testClient(t *testing.T, edit func(*Config)) *Client {
@@ -233,5 +234,57 @@ func TestSkipCrossfade(t *testing.T) {
 	}
 	if body := string(<-bodies); !strings.Contains(body, `"track":{"encoded":"next"}`) {
 		t.Errorf("the skip request %s does not play the next track", body)
+	}
+}
+
+// TestNodeCloseDeadline pins the shutdown budget: in time the node says goodbye,
+// out of time it just hangs up.
+func TestNodeCloseDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		expired bool
+		want    int
+	}{
+		{"in time", false, websocket.CloseNormalClosure},
+		{"out of time", true, websocket.CloseAbnormalClosure},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			codes := make(chan int, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if err != nil {
+					t.Error(err)
+					codes <- 0
+					return
+				}
+				defer conn.Close()
+				_, _, err = conn.ReadMessage()
+				code := websocket.CloseAbnormalClosure
+				var closeErr *websocket.CloseError
+				if errors.As(err, &closeErr) {
+					code = closeErr.Code
+				}
+				codes <- code
+			}))
+			defer server.Close()
+
+			ctx := context.Background()
+			client := testClient(t, nil)
+			node, err := client.AddNode(ctx, NodeConfig{Name: "test", Address: strings.TrimPrefix(server.URL, "http://")})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			closeCtx := ctx
+			if tc.expired {
+				expired, cancel := context.WithCancel(ctx)
+				cancel()
+				closeCtx = expired
+			}
+			node.Close(closeCtx)
+			if got := <-codes; got != tc.want {
+				t.Errorf("the node closed with code %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
