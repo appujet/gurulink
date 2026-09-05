@@ -12,9 +12,6 @@ const DefaultSource = "ytmsearch"
 // Query rejection reasons, all reported by [Client.Search].
 var (
 	ErrEmptyQuery        = errors.New("gurulink: empty query")
-	ErrLinksDisallowed   = errors.New("gurulink: link queries are disallowed")
-	ErrLinkBlocked       = errors.New("gurulink: query matches a blocked link")
-	ErrLinkNotAllowed    = errors.New("gurulink: query matches no allowed link")
 	ErrSpeakQueryTooLong = errors.New("gurulink: speak queries are limited to 100 characters")
 )
 
@@ -45,16 +42,13 @@ func SourceOf(query string) string {
 	return src
 }
 
-// identifier turns a user query into a /loadtracks identifier and checks it
-// against the client's link rules. A URL is passed through untouched, anything
-// else gets the source prefix it asked for, or the configured default.
+// identifier turns a user query into a /loadtracks identifier. A URL is passed
+// through untouched, anything else gets the source prefix it asked for, or the
+// configured default.
 func (c *Client) identifier(query, source string) (string, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return "", ErrEmptyQuery
-	}
-	if err := c.checkLinks(query); err != nil {
-		return "", err
 	}
 	if IsLink(query) {
 		return query, nil
@@ -74,38 +68,6 @@ func (c *Client) identifier(query, source string) (string, error) {
 		return "", ErrSpeakQueryTooLong
 	}
 	return src + ":" + query, nil
-}
-
-// checkLinks applies the blocked/allowed link rules. Queries are user input, so
-// this runs before anything reaches a node.
-func (c *Client) checkLinks(query string) error {
-	if containsAny(query, c.cfg.BlockedLinks) {
-		return ErrLinkBlocked
-	}
-	if !IsLink(query) {
-		return nil
-	}
-	if c.cfg.DisallowLinks {
-		return ErrLinksDisallowed
-	}
-	if len(c.cfg.AllowedLinks) > 0 && !containsAny(query, c.cfg.AllowedLinks) {
-		return ErrLinkNotAllowed
-	}
-	return nil
-}
-
-// containsAny reports whether s contains any of subs, ignoring case.
-//
-// ponytail: substring match, not regexp. Add a regexp variant of the config
-// fields if plain domains and words stop being enough.
-func containsAny(s string, subs []string) bool {
-	s = strings.ToLower(s)
-	for _, sub := range subs {
-		if sub != "" && strings.Contains(s, strings.ToLower(sub)) {
-			return true
-		}
-	}
-	return false
 }
 
 // sourceAliases maps every shorthand lavalink-client accepts (MIT; see NOTICE)

@@ -17,7 +17,6 @@ func (p *Player) startIdle() {
 		return
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.idleTimer != nil {
 		p.idleTimer.Stop()
 	}
@@ -33,16 +32,22 @@ func (p *Player) startIdle() {
 			p.log.Warn("gurulink: destroy idle player", slog.Any("err", err))
 		}
 	})
+	p.mu.Unlock()
+	p.client.emit(&IdleStartEvent{Player: p, Timeout: timeout})
 }
 
 // stopIdle disarms the countdown.
 func (p *Player) stopIdle() {
 	p.mu.Lock()
-	if p.idleTimer != nil {
+	armed := p.idleTimer != nil
+	if armed {
 		p.idleTimer.Stop()
 		p.idleTimer = nil
 	}
 	p.mu.Unlock()
+	if armed {
+		p.client.emit(&IdleCancelEvent{Player: p})
+	}
 }
 
 // handle reacts to a node event, after the client's listeners have seen it. It
@@ -146,10 +151,11 @@ func (p *Player) voiceClosed(code int) {
 		if channelID == "" {
 			return
 		}
+		p.client.emit(&PlayerReconnectEvent{Player: p, ChannelID: channelID})
 		// The voice session is dead for good. Leaving and rejoining is what makes
 		// Discord hand out a new one.
 		go p.background(func(ctx context.Context) error {
-			if err := p.client.cfg.SendVoiceUpdate(ctx, p.guildID, nil, false, false); err != nil {
+			if err := p.Disconnect(ctx); err != nil {
 				return err
 			}
 			return p.Connect(ctx, channelID, mute, deaf)

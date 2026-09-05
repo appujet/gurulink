@@ -3,6 +3,8 @@ package gurulink
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"testing"
 )
 
@@ -23,7 +25,7 @@ func testClient(t *testing.T, edit func(*Config)) *Client {
 }
 
 // TestIdentifier is the trust boundary: user queries turn into node identifiers
-// here, and the link rules have to hold.
+// here.
 func TestIdentifier(t *testing.T) {
 	client := testClient(t, nil)
 	for _, tc := range []struct{ query, source, want string }{
@@ -59,34 +61,66 @@ func TestIdentifier(t *testing.T) {
 	}
 }
 
-func TestLinkRules(t *testing.T) {
-	blocked := testClient(t, func(c *Config) { c.BlockedLinks = []string{"Rickroll", "pornhub.com"} })
-	for _, query := range []string{"https://pornhub.com/x", "a rickroll please"} {
-		if _, err := blocked.identifier(query, ""); !errors.Is(err, ErrLinkBlocked) {
-			t.Errorf("%q should be blocked, got %v", query, err)
+// TestVoiceStateEvents covers the voice-state fan-out: one Discord update turns
+// into the channel, mute, deaf and suppress events, another user's update into
+// join/leave, and our own leave must not destroy the player while a kick must.
+func TestVoiceStateEvents(t *testing.T) {
+	var seen []string
+	client := testClient(t, func(c *Config) {
+		c.Listeners = []Listener{func(e Event) { seen = append(seen, fmt.Sprintf("%T", e)) }}
+	})
+	// A player with a session-less node: every event fires, no request is sent.
+	player := newPlayer(client, &Node{cfg: NodeConfig{Name: "test"}, client: client, log: client.Logger()}, "g")
+	client.players["g"] = player
+
+	ctx := context.Background()
+	send := func(u VoiceStateUpdate) {
+		t.Helper()
+		seen = nil
+		if err := client.OnVoiceStateUpdate(ctx, u); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if _, err := blocked.identifier("https://youtu.be/x", ""); err != nil {
-		t.Errorf("an unblocked link should pass: %v", err)
+	want := func(events ...string) {
+		t.Helper()
+		if !slices.Equal(seen, events) {
+			t.Errorf("got %v, want %v", seen, events)
+		}
 	}
 
-	allowed := testClient(t, func(c *Config) { c.AllowedLinks = []string{"youtube.com", "youtu.be"} })
-	if _, err := allowed.identifier("https://youtu.be/x", ""); err != nil {
-		t.Errorf("an allowed link should pass: %v", err)
+	joined := VoiceStateUpdate{GuildID: "g", ChannelID: "c1", SessionID: "s", SelfDeaf: true}
+	send(joined)
+	want("*gurulink.PlayerChannelMoveEvent", "*gurulink.PlayerDeafChangeEvent")
+	send(joined)
+	want()
+
+	moderated := joined
+	moderated.ServerMute, moderated.Suppress = true, true
+	send(moderated)
+	want("*gurulink.PlayerMuteChangeEvent", "*gurulink.PlayerSuppressChangeEvent")
+
+	send(VoiceStateUpdate{GuildID: "g", ChannelID: "c1", UserID: "2"})
+	want("*gurulink.PlayerVoiceJoinEvent")
+	send(VoiceStateUpdate{GuildID: "g", ChannelID: "c2", UserID: "2"})
+	want("*gurulink.PlayerVoiceLeaveEvent")
+
+	seen = nil
+	if err := player.Disconnect(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := allowed.identifier("https://example.com/x", ""); !errors.Is(err, ErrLinkNotAllowed) {
-		t.Errorf("a link outside the allow list should fail, got %v", err)
-	}
-	if _, err := allowed.identifier("never gonna", ""); err != nil {
-		t.Errorf("the allow list is for links only: %v", err)
+	want("*gurulink.PlayerDisconnectEvent")
+	// Discord echoes the leave we asked for; the player has to survive it.
+	send(VoiceStateUpdate{GuildID: "g"})
+	want()
+	if player.Destroyed() {
+		t.Fatal("our own disconnect destroyed the player")
 	}
 
-	none := testClient(t, func(c *Config) { c.DisallowLinks = true })
-	if _, err := none.identifier("https://youtu.be/x", ""); !errors.Is(err, ErrLinksDisallowed) {
-		t.Errorf("links should be disallowed, got %v", err)
-	}
-	if _, err := none.identifier("never gonna", ""); err != nil {
-		t.Errorf("searches still work: %v", err)
+	send(moderated)
+	send(VoiceStateUpdate{GuildID: "g"}) // kicked: no request of ours came first
+	want("*gurulink.PlayerDisconnectEvent", "*gurulink.PlayerDestroyEvent")
+	if !player.Destroyed() {
+		t.Error("a kick should destroy the player")
 	}
 }
 

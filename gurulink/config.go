@@ -31,12 +31,6 @@ type Config struct {
 
 	// DefaultSource is the search prefix for queries that name none.
 	DefaultSource string
-	// BlockedLinks rejects any query containing one of these, case-insensitive.
-	BlockedLinks []string
-	// AllowedLinks, when set, rejects link queries containing none of these.
-	AllowedLinks []string
-	// DisallowLinks rejects link queries outright, leaving only searches.
-	DisallowLinks bool
 
 	// QueueStore persists queues; nil keeps them in memory only.
 	QueueStore queue.Store
@@ -78,7 +72,7 @@ type Config struct {
 // withDefaults fills in everything the caller left blank.
 func (c Config) withDefaults() Config {
 	if c.ClientName == "" {
-		c.ClientName = "gurulink"
+		c.ClientName = "Gurulink (https://github.com/appujet/gurulink)"
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()

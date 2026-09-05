@@ -2,6 +2,7 @@ package gurulink
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/appujet/gurulink/lavalink"
 )
@@ -40,12 +41,41 @@ type StatsEvent struct {
 	lavalink.Stats
 }
 
-// DisconnectEvent is a node's websocket going away. The node reconnects on its
-// own unless [Config.Reconnect] says otherwise.
+// ConnectEvent is a node's websocket coming up. The node is not usable yet: it
+// takes requests once its [ReadyEvent] hands out a session id.
+type ConnectEvent struct {
+	Node *Node
+}
+
+// DisconnectEvent is a node's websocket going away. The node redials on its own
+// up to [Config.MaxReconnects] times.
 type DisconnectEvent struct {
 	Node   *Node
 	Code   int
 	Reason string
+}
+
+// ReconnectEvent fires before each redial of a dropped node, so a bot can say
+// what it is waiting for. Attempt counts from 1.
+type ReconnectEvent struct {
+	Node    *Node
+	Attempt int
+	Delay   time.Duration
+}
+
+// ResumedEvent is a node that took our old session back, with the players it
+// kept playing while we were gone. After a process restart those are players
+// this client knows nothing about: rebuild them with [Client.NewPlayer] and
+// [Player.Play], or destroy them.
+type ResumedEvent struct {
+	Node    *Node
+	Players []lavalink.PlayerInfo
+}
+
+// NodeRemovedEvent is a node that left the client through [Client.RemoveNode].
+// Its players moved elsewhere or were destroyed before this fires.
+type NodeRemovedEvent struct {
+	Node *Node
 }
 
 // ErrorEvent is a failure the client had nowhere else to report: a broken
@@ -179,11 +209,40 @@ type PlayerDestroyEvent struct {
 	Reason DestroyReason
 }
 
-// PlayerMoveEvent fires after a player was rebuilt on another node.
-type PlayerMoveEvent struct {
+// PlayerNodeMoveEvent fires after a player was rebuilt on another node.
+type PlayerNodeMoveEvent struct {
 	Player *Player
 	From   *Node
 	To     *Node
+}
+
+// PlayerChannelMoveEvent fires when the bot was moved between voice channels,
+// by us or by a moderator. From is empty on the first join.
+type PlayerChannelMoveEvent struct {
+	Player *Player
+	From   string
+	To     string
+}
+
+// PlayerPauseEvent fires when playback was paused or resumed. It only covers
+// state the node accepted, so it does not fire when a pause was a no-op.
+type PlayerPauseEvent struct {
+	Player *Player
+	Paused bool
+}
+
+// PlayerDisconnectEvent is the bot leaving a voice channel with the player
+// intact, either through [Player.Disconnect] or because it was kicked out.
+type PlayerDisconnectEvent struct {
+	Player    *Player
+	ChannelID string
+}
+
+// PlayerReconnectEvent fires when a player rejoins its channel to rebuild a
+// voice session Discord threw away. See [WebSocketClosedEvent].
+type PlayerReconnectEvent struct {
+	Player    *Player
+	ChannelID string
 }
 
 // QueueEndEvent fires when a track finished and the queue had nothing to follow
@@ -194,4 +253,58 @@ type QueueEndEvent struct {
 	// Track is the one that just ended.
 	Track  lavalink.Track
 	Reason lavalink.TrackEndReason
+}
+
+// IdleStartEvent fires when the queue ran dry and the
+// [Config.EmptyQueueTimeout] countdown started. Letting it run out destroys the
+// player, which arrives as a [PlayerDestroyEvent] with [DestroyQueueEmpty].
+type IdleStartEvent struct {
+	Player  *Player
+	Timeout time.Duration
+}
+
+// IdleCancelEvent fires when a track arrived in time and the countdown from
+// [IdleStartEvent] was called off.
+type IdleCancelEvent struct {
+	Player *Player
+}
+
+// PlayerMuteChangeEvent fires when the bot's mute state changed. SelfMute is
+// ours to set; ServerMute a moderator's.
+type PlayerMuteChangeEvent struct {
+	Player     *Player
+	SelfMute   bool
+	ServerMute bool
+}
+
+// PlayerDeafChangeEvent fires when the bot's deaf state changed. SelfDeaf is
+// ours to set; ServerDeaf a moderator's.
+type PlayerDeafChangeEvent struct {
+	Player     *Player
+	SelfDeaf   bool
+	ServerDeaf bool
+}
+
+// PlayerSuppressChangeEvent fires when the bot was suppressed or unsuppressed,
+// which is what a stage channel does to anyone who is not a speaker.
+type PlayerSuppressChangeEvent struct {
+	Player   *Player
+	Suppress bool
+}
+
+// PlayerVoiceJoinEvent is another user joining the player's channel. Bots see
+// this only for guilds they have the GuildVoiceStates intent for.
+type PlayerVoiceJoinEvent struct {
+	Player *Player
+	UserID string
+}
+
+// PlayerVoiceLeaveEvent is another user leaving the player's channel.
+//
+// ponytail: any update naming a different channel counts as a leave, since
+// tracking who sits where would need a member list this package does not have.
+// Check your Discord library's cache before acting on it.
+type PlayerVoiceLeaveEvent struct {
+	Player *Player
+	UserID string
 }

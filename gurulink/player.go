@@ -62,21 +62,24 @@ type Player struct {
 	queue   *queue.Queue
 	log     *slog.Logger
 
-	mu        sync.RWMutex
-	node      *Node
-	channelID string
-	selfMute  bool
-	selfDeaf  bool
-	voice     lavalink.VoiceState
-	state     lavalink.PlayerState
-	stateAt   time.Time
-	volume    int
-	paused    bool
-	filters   lavalink.Filters
-	repeat    RepeatMode
-	errors    int
-	idleTimer *time.Timer
-	destroyed bool
+	mu         sync.RWMutex
+	node       *Node
+	channelID  string
+	selfMute   bool
+	selfDeaf   bool
+	serverMute bool
+	serverDeaf bool
+	suppress   bool
+	voice      lavalink.VoiceState
+	state      lavalink.PlayerState
+	stateAt    time.Time
+	volume     int
+	paused     bool
+	filters    lavalink.Filters
+	repeat     RepeatMode
+	errors     int
+	idleTimer  *time.Timer
+	destroyed  bool
 }
 
 func newPlayer(client *Client, node *Node, guildID string) *Player {
@@ -278,7 +281,15 @@ func (p *Player) Pause(ctx context.Context, pause bool) error {
 	if tape := p.client.cfg.Tape; tape != nil {
 		update.Tape = lavalink.Value(*tape)
 	}
-	return p.update(ctx, update)
+	was := p.Paused()
+	if err := p.update(ctx, update); err != nil {
+		return err
+	}
+	// The node's reply is the truth, so a pause that changed nothing stays quiet.
+	if now := p.Paused(); now != was {
+		p.client.emit(&PlayerPauseEvent{Player: p, Paused: now})
+	}
+	return nil
 }
 
 // Resume unpauses playback.

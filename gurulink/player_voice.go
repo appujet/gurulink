@@ -26,25 +26,66 @@ func (p *Player) Connect(ctx context.Context, channelID string, selfMute, selfDe
 // [Player.Connect] can pick things back up.
 func (p *Player) Disconnect(ctx context.Context) error {
 	p.mu.Lock()
+	channelID := p.channelID
 	p.channelID, p.voice = "", lavalink.VoiceState{}
 	p.mu.Unlock()
-	return p.client.cfg.SendVoiceUpdate(ctx, p.guildID, nil, false, false)
+	if err := p.client.cfg.SendVoiceUpdate(ctx, p.guildID, nil, false, false); err != nil {
+		return err
+	}
+	p.client.emit(&PlayerDisconnectEvent{Player: p, ChannelID: channelID})
+	return nil
 }
 
 // onVoiceState takes Discord's voice state for the bot. The node needs the session id and the
-// channel, and neither changes unless the voice session is rebuilt or the bot is moved.
-func (p *Player) onVoiceState(ctx context.Context, channelID, sessionID string) error {
+// channel, and neither changes unless the voice session is rebuilt or the bot is moved. The rest
+// of the state only turns into events.
+func (p *Player) onVoiceState(ctx context.Context, u VoiceStateUpdate) error {
 	p.mu.Lock()
-	p.channelID = channelID
+	from := p.channelID
+	muted := p.selfMute != u.SelfMute || p.serverMute != u.ServerMute
+	deafened := p.selfDeaf != u.SelfDeaf || p.serverDeaf != u.ServerDeaf
+	suppressed := p.suppress != u.Suppress
+	p.channelID = u.ChannelID
+	p.selfMute, p.serverMute = u.SelfMute, u.ServerMute
+	p.selfDeaf, p.serverDeaf = u.SelfDeaf, u.ServerDeaf
+	p.suppress = u.Suppress
 	before := p.voice
-	p.voice.SessionID, p.voice.ChannelID = sessionID, channelID
+	p.voice.SessionID, p.voice.ChannelID = u.SessionID, u.ChannelID
 	voice := p.voice
 	p.mu.Unlock()
+
+	if from != u.ChannelID {
+		p.client.emit(&PlayerChannelMoveEvent{Player: p, From: from, To: u.ChannelID})
+	}
+	if muted {
+		p.client.emit(&PlayerMuteChangeEvent{Player: p, SelfMute: u.SelfMute, ServerMute: u.ServerMute})
+	}
+	if deafened {
+		p.client.emit(&PlayerDeafChangeEvent{Player: p, SelfDeaf: u.SelfDeaf, ServerDeaf: u.ServerDeaf})
+	}
+	if suppressed {
+		p.client.emit(&PlayerSuppressChangeEvent{Player: p, Suppress: u.Suppress})
+	}
 
 	if voice == before || !voice.Complete() {
 		return nil
 	}
 	return p.update(ctx, lavalink.PlayerUpdate{Voice: &voice})
+}
+
+// otherVoiceState reports somebody else coming or going. Discord sends these for
+// every channel in the guild, so a leave is only as accurate as the channel the
+// update carries: see [PlayerVoiceLeaveEvent].
+func (p *Player) otherVoiceState(u VoiceStateUpdate) {
+	channelID := p.ChannelID()
+	if channelID == "" {
+		return
+	}
+	if u.ChannelID == channelID {
+		p.client.emit(&PlayerVoiceJoinEvent{Player: p, UserID: u.UserID})
+		return
+	}
+	p.client.emit(&PlayerVoiceLeaveEvent{Player: p, UserID: u.UserID})
 }
 
 // onVoiceServer takes Discord's voice server, which is what actually hands the
@@ -124,7 +165,7 @@ func (p *Player) MoveNode(ctx context.Context, node *Node) error {
 		p.mu.Unlock()
 		return fmt.Errorf("gurulink: move player to %s: %w", node.Name(), err)
 	}
-	p.client.emit(&PlayerMoveEvent{Player: p, From: from, To: node})
+	p.client.emit(&PlayerNodeMoveEvent{Player: p, From: from, To: node})
 	return nil
 }
 

@@ -149,6 +149,7 @@ func (c *Client) RemoveNode(ctx context.Context, name string) error {
 		}
 	}
 	node.Close()
+	c.emit(&NodeRemovedEvent{Node: node})
 	return nil
 }
 
@@ -244,7 +245,7 @@ func (c *Client) forget(guildID string) {
 // Search resolves a user query on the least loaded node. source names a search
 // prefix ("spotify", "ytsearch", …) and may be empty to take
 // [Config.DefaultSource]; a query that carries its own prefix, or is a URL,
-// keeps it. Link rules from [Config] are applied first.
+// keeps it.
 func (c *Client) Search(ctx context.Context, query, source string) (lavalink.LoadResult, error) {
 	node := c.BestNode()
 	if node == nil {
@@ -261,17 +262,45 @@ func (c *Client) searchOn(ctx context.Context, node *Node, query, source string)
 	return node.LoadTracks(ctx, identifier)
 }
 
-// OnVoiceStateUpdate feeds Discord's VOICE_STATE_UPDATE for the bot itself in.
-// An empty channelID means the bot left, which destroys the player.
-func (c *Client) OnVoiceStateUpdate(ctx context.Context, guildID, channelID, sessionID string) error {
-	player := c.Player(guildID)
+// VoiceStateUpdate is Discord's VOICE_STATE_UPDATE, cut down to the fields
+// gurulink reads. Forward every one a guild sends, the bot's own and other
+// users': UserID is what tells them apart, and leaving it empty means the bot.
+type VoiceStateUpdate struct {
+	GuildID string
+	// ChannelID is empty when the user left voice altogether.
+	ChannelID  string
+	UserID     string
+	SessionID  string
+	SelfMute   bool
+	SelfDeaf   bool
+	ServerMute bool
+	ServerDeaf bool
+	// Suppress is set for anyone who is not a speaker in a stage channel.
+	Suppress bool
+}
+
+// OnVoiceStateUpdate feeds Discord's VOICE_STATE_UPDATE in. For the bot itself
+// an empty ChannelID means it left, which destroys the player; another user's
+// update only turns into a [PlayerVoiceJoinEvent] or [PlayerVoiceLeaveEvent].
+func (c *Client) OnVoiceStateUpdate(ctx context.Context, update VoiceStateUpdate) error {
+	player := c.Player(update.GuildID)
 	if player == nil {
 		return nil
 	}
-	if channelID == "" {
+	if update.UserID != "" && update.UserID != c.cfg.UserID {
+		player.otherVoiceState(update)
+		return nil
+	}
+	if update.ChannelID == "" {
+		// [Player.Disconnect] cleared the channel before Discord echoed the leave
+		// back, so an empty one here means we left on purpose and the player stays.
+		if player.ChannelID() == "" {
+			return nil
+		}
+		c.emit(&PlayerDisconnectEvent{Player: player, ChannelID: player.ChannelID()})
 		return player.Destroy(ctx, DestroyDisconnected)
 	}
-	return player.onVoiceState(ctx, channelID, sessionID)
+	return player.onVoiceState(ctx, update)
 }
 
 // OnVoiceServerUpdate feeds Discord's VOICE_SERVER_UPDATE in. This is what

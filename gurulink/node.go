@@ -183,6 +183,7 @@ func (n *Node) Open(ctx context.Context) error {
 	n.mu.Unlock()
 
 	n.log.Info("gurulink: node connected", slog.String("node", n.cfg.Name))
+	n.client.emit(&ConnectEvent{Node: n})
 	go n.listen(loopCtx, conn)
 	return nil
 }
@@ -305,6 +306,7 @@ func (n *Node) reconnect() {
 			return
 		}
 		delay := min(cfg.ReconnectDelay*time.Duration(attempt), maxReconnectDelay)
+		n.client.emit(&ReconnectEvent{Node: n, Attempt: attempt, Delay: delay})
 		select {
 		case <-time.After(delay):
 		case <-n.client.done:
@@ -385,7 +387,7 @@ func (n *Node) decode(data []byte, out any) bool {
 }
 
 // afterReady turns resuming on and puts our players back on the node. A resumed
-// session kept playing, so it needs nothing.
+// session kept playing, so its players are reported instead of rebuilt.
 func (n *Node) afterReady(resumed bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -397,6 +399,13 @@ func (n *Node) afterReady(resumed bool) {
 		}
 	}
 	if resumed {
+		// Whoever handles this needs to know what the node kept, and after a
+		// process restart we have no record of it.
+		infos, err := n.PlayerInfos(ctx)
+		if err != nil {
+			n.client.emit(&ErrorEvent{Node: n, Err: fmt.Errorf("gurulink: list resumed players: %w", err)})
+		}
+		n.client.emit(&ResumedEvent{Node: n, Players: infos})
 		return
 	}
 	for _, player := range n.client.Players() {

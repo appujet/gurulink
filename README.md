@@ -33,8 +33,10 @@ node, err := client.AddNode(ctx, gurulink.NodeConfig{
 	Name: "main", Address: "localhost:2333", Password: "youshallnotpass",
 })
 
-// Forward Discord's two voice events.
-client.OnVoiceStateUpdate(ctx, guildID, channelID, sessionID)
+// Forward Discord's voice events.
+client.OnVoiceStateUpdate(ctx, gurulink.VoiceStateUpdate{
+	GuildID: guildID, ChannelID: channelID, UserID: userID, SessionID: sessionID,
+})
 client.OnVoiceServerUpdate(ctx, guildID, token, endpoint)
 
 player, err := client.NewPlayer(guildID)
@@ -58,13 +60,18 @@ Queued tracks start on their own as the ones before them end.
 - **Filters** — the ten stock filters, the plugin ones (LavaDSPX,
   lavalink-filter-plugin), and presets: `Nightcore`, `Vaporwave`, `EQBassboost*`,
   `Output*`.
-- **Search** — ~70 source shorthands (`spotify`, `yt`, `dz`, `tidal`, …) plus
-  blocked/allowed link rules applied before anything reaches a node.
+- **Search** — ~70 source shorthands (`spotify`, `yt`, `dz`, `tidal`, …).
 - **Plugins** — SponsorBlock, LavaSearch, LavaLyrics, chapters, route planner.
 - **Kairo extras** — crossfade with next-track pre-buffering and tape pitch
   ramps.
 
 Every event is delivered to `Listener`s; `gurulink.On[E]` adapts a typed handler.
+There are 38 of them: the node lifecycle (connect, ready, stats, disconnect,
+reconnect, resumed, removed), playback (track start/promoted/end/exception/stuck,
+queue end, idle start/cancel), the voice connection (channel move, node move,
+disconnect, reconnect, socket closed, mute/deaf/suppress changes, other users
+joining and leaving), the plugins (segments, chapters, lyrics), and
+create/destroy/error/unknown.
 
 ## Packages
 
