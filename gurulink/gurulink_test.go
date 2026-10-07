@@ -151,6 +151,60 @@ func TestVoiceStateEvents(t *testing.T) {
 	}
 }
 
+// TestVoiceMoveKeepsSession replays a channel move: the voice state carries a
+// new channel but the same session, so it must not patch the node — the token
+// it would send is stale, and Lavalink answers that patch with a 500/4006.
+// Only the fresh voice server, with its new token, patches.
+func TestVoiceMoveKeepsSession(t *testing.T) {
+	client := testClient(t, nil)
+	bodies := make(chan []byte, 4)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+	client.players["g"] = player
+
+	ctx := context.Background()
+	// Initial join: state alone patches nothing, the server completes it.
+	if err := client.OnVoiceStateUpdate(ctx, VoiceStateUpdate{GuildID: "g", ChannelID: "c1", SessionID: "s1"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case body := <-bodies:
+		t.Fatalf("the bare voice state must not patch the node, got %s", body)
+	default:
+	}
+	if err := client.OnVoiceServerUpdate(ctx, "g", "t1", "e1"); err != nil {
+		t.Fatal(err)
+	}
+	body := string(<-bodies)
+	for _, want := range []string{`"token":"t1"`, `"endpoint":"e1"`, `"sessionId":"s1"`, `"channelId":"c1"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("the join patch %s is missing %s", body, want)
+		}
+	}
+
+	// The move: same session, new channel. No patch until the new server.
+	if err := client.OnVoiceStateUpdate(ctx, VoiceStateUpdate{GuildID: "g", ChannelID: "c2", SessionID: "s1"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case body := <-bodies:
+		t.Fatalf("a channel move must wait for the fresh voice server, got %s", body)
+	default:
+	}
+	if got := player.ChannelID(); got != "c2" {
+		t.Fatalf("the player should track the new channel, got %q", got)
+	}
+
+	if err := client.OnVoiceServerUpdate(ctx, "g", "t2", "e1"); err != nil {
+		t.Fatal(err)
+	}
+	body = string(<-bodies)
+	for _, want := range []string{`"token":"t2"`, `"sessionId":"s1"`, `"channelId":"c2"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("the move patch %s is missing %s", body, want)
+		}
+	}
+}
+
 func TestNewValidates(t *testing.T) {
 	if _, err := New(Config{}); err == nil {
 		t.Error("a client needs a user id")

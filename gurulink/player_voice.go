@@ -36,18 +36,18 @@ func (p *Player) Disconnect(ctx context.Context) error {
 }
 
 // onVoiceState takes Discord's voice state for the bot. The node needs the
-// session id and the channel; the rest only turns into events.
+// session id and the channel; the rest only turns into events. A channel move
 func (p *Player) onVoiceState(ctx context.Context, u VoiceStateUpdate) error {
 	p.mu.Lock()
 	from := p.channelID
 	muted := p.selfMute != u.SelfMute || p.serverMute != u.ServerMute
 	deafened := p.selfDeaf != u.SelfDeaf || p.serverDeaf != u.ServerDeaf
 	suppressed := p.suppress != u.Suppress
+	sessionChanged := p.voice.SessionID != u.SessionID
 	p.channelID = u.ChannelID
 	p.selfMute, p.serverMute = u.SelfMute, u.ServerMute
 	p.selfDeaf, p.serverDeaf = u.SelfDeaf, u.ServerDeaf
 	p.suppress = u.Suppress
-	before := p.voice
 	p.voice.SessionID, p.voice.ChannelID = u.SessionID, u.ChannelID
 	voice := p.voice
 	p.mu.Unlock()
@@ -65,7 +65,7 @@ func (p *Player) onVoiceState(ctx context.Context, u VoiceStateUpdate) error {
 		p.client.emit(&PlayerSuppressChangeEvent{Player: p, Suppress: u.Suppress})
 	}
 
-	if voice == before || !voice.Complete() {
+	if !sessionChanged || !voice.Complete() {
 		return nil
 	}
 	return p.update(ctx, lavalink.PlayerUpdate{Voice: &voice})
