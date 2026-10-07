@@ -51,8 +51,10 @@ const (
 )
 
 // StartNext reports whether the client should now play the next queued track.
+// Cleanup is a failed track the node dropped, like loadFailed: skip past it
+// rather than stalling on it.
 func (r TrackEndReason) StartNext() bool {
-	return r == ReasonFinished || r == ReasonLoadFailed
+	return r == ReasonFinished || r == ReasonLoadFailed || r == ReasonCleanup
 }
 
 // Promoted reports whether the node moved to the successor by itself.

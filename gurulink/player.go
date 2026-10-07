@@ -82,11 +82,21 @@ type Player struct {
 	errors     int
 	idleTimer  *time.Timer
 	destroyed  bool
+	// manualSkip marks an explicit skip via a crossfade transition, so the
+	// following TrackEnd (crossfade/gapless) advances even with RepeatTrack,
+	// like lavalink-client's internal_manualSkipPending.
+	manualSkip bool
+	// nextSync debounces NextTrack re-syncs after queue edits, like
+	// lavalink-client's scheduleNextTrackSync (50ms): rapid edits coalesce
+	// into one node call, and tests reading the synchronous Skip request
+	// win the race against the delayed sync.
+	nextSyncTimer *time.Timer
+	nextSyncGen   int
 }
 
 func newPlayer(client *Client, node *Node, guildID string) *Player {
 	cfg := client.cfg
-	return &Player{
+	p := &Player{
 		client:  client,
 		guildID: guildID,
 		queue: queue.New(guildID, queue.Config{
@@ -98,6 +108,21 @@ func newPlayer(client *Client, node *Node, guildID string) *Player {
 		node:   node,
 		volume: 100,
 	}
+	// Keep the node's pre-buffered successor in step with the queue head, like
+	// lavalink-client's headWatcher: any edit that changes what plays next
+	// re-syncs NextTrack, so a transition never fades into a stale track.
+	// Current-only changes (a new track taking over) leave the head alone.
+	outer := p.queue.OnChange()
+	p.queue.SetOnChange(func(ctx context.Context, guildID string, change queue.Change, tracks []lavalink.Track) {
+		if outer != nil {
+			outer(ctx, guildID, change, tracks)
+		}
+		if change == queue.Current {
+			return
+		}
+		p.schedulePreBuffer()
+	})
+	return p
 }
 
 // GuildID is the guild this player belongs to.
@@ -186,10 +211,39 @@ func (p *Player) Repeat() RepeatMode {
 	return p.repeat
 }
 
-// SetRepeat takes effect on the next track end, so it needs no node call.
+// SetRepeat takes effect on the next track end, and re-syncs the pre-buffered
+// successor right away: looping one track must fade into itself, not into the
+// head it named before.
 func (p *Player) SetRepeat(mode RepeatMode) {
 	p.mu.Lock()
 	p.repeat = mode
+	p.mu.Unlock()
+	p.schedulePreBuffer()
+}
+
+// schedulePreBuffer re-syncs NextTrack after a short debounce, coalescing
+// rapid queue edits into one node call like lavalink-client's
+// scheduleNextTrackSync.
+func (p *Player) schedulePreBuffer() {
+	if !p.crossfading() || p.Destroyed() {
+		return
+	}
+	p.mu.Lock()
+	p.nextSyncGen++
+	gen := p.nextSyncGen
+	if p.nextSyncTimer != nil {
+		p.nextSyncTimer.Stop()
+	}
+	p.nextSyncTimer = time.AfterFunc(50*time.Millisecond, func() {
+		p.mu.Lock()
+		if gen != p.nextSyncGen || p.destroyed {
+			p.mu.Unlock()
+			return
+		}
+		p.nextSyncTimer = nil
+		p.mu.Unlock()
+		p.background(p.PreBuffer)
+	})
 	p.mu.Unlock()
 }
 
@@ -246,10 +300,16 @@ func (p *Player) play(ctx context.Context, track lavalink.Track) error {
 	p.stopIdle()
 	p.queue.SetCurrent(ctx, &track)
 	resume := false
-	return p.update(ctx, lavalink.PlayerUpdate{
+	if err := p.update(ctx, lavalink.PlayerUpdate{
 		Track:  &lavalink.UpdateTrack{Encoded: lavalink.Value(track.Encoded), UserData: track.UserData},
 		Paused: &resume,
-	})
+	}); err != nil {
+		return err
+	}
+	// Keep the pre-buffered successor in step: the head changed (or the track
+	// was replaced), so the node must fade into the new head, not a stale one.
+	p.schedulePreBuffer()
+	return nil
 }
 
 // PlayIdentifier lets the node resolve a search phrase or URL. Use
@@ -319,9 +379,14 @@ func (p *Player) SetEndTime(ctx context.Context, end lavalink.Duration) error {
 }
 
 // Skip plays the next track, ignoring [RepeatTrack]. With crossfade on it fades
-// into it rather than cutting.
+// into it rather than cutting. The queue moves on the following TrackEnd, like
+// lavalink-client: the update only arms the transition, and manualSkip makes
+// that end ignore repeat.
 func (p *Player) Skip(ctx context.Context) error {
 	if next, ok := p.queue.Peek(); ok && p.Playing() && p.crossfading() {
+		p.mu.Lock()
+		p.manualSkip = true
+		p.mu.Unlock()
 		err := p.update(ctx, lavalink.PlayerUpdate{
 			NextTrack:  lavalink.Value(lavalink.UpdateTrack{Encoded: lavalink.Value(next.Encoded), UserData: next.UserData}),
 			Transition: true,
@@ -329,9 +394,42 @@ func (p *Player) Skip(ctx context.Context) error {
 		if err == nil {
 			return nil
 		}
+		p.mu.Lock()
+		p.manualSkip = false
+		p.mu.Unlock()
 		p.log.Debug("gurulink: skip with a crossfade", slog.Any("err", err))
 	}
 	return p.next(ctx, lavalink.ReasonStopped)
+}
+
+// takeManualSkip reports and clears a pending manual skip.
+func (p *Player) takeManualSkip() bool {
+	p.mu.Lock()
+	manual := p.manualSkip
+	p.manualSkip = false
+	p.mu.Unlock()
+	return manual
+}
+
+// effectiveNext is the track the node should pre-buffer: the repeat-track
+// itself when looping one, the head of the queue otherwise, or the current
+// track again when looping a dry queue. Mirrors lavalink-client's
+// effectiveNextCandidate.
+func (p *Player) effectiveNext() (lavalink.Track, bool) {
+	if p.Repeat() == RepeatTrack {
+		if current := p.queue.Current(); current != nil {
+			return *current, true
+		}
+	}
+	if next, ok := p.queue.Peek(); ok {
+		return next, true
+	}
+	if p.Repeat() == RepeatQueue {
+		if current := p.queue.Current(); current != nil {
+			return *current, true
+		}
+	}
+	return lavalink.Track{}, false
 }
 
 // SkipTo skips the queued tracks before index i and plays that one.
@@ -353,10 +451,14 @@ func (p *Player) Back(ctx context.Context) error {
 	// Back already made it current.
 	p.stopIdle()
 	resume := false
-	return p.update(ctx, lavalink.PlayerUpdate{
+	if err := p.update(ctx, lavalink.PlayerUpdate{
 		Track:  &lavalink.UpdateTrack{Encoded: lavalink.Value(track.Encoded), UserData: track.UserData},
 		Paused: &resume,
-	})
+	}); err != nil {
+		return err
+	}
+	p.schedulePreBuffer()
+	return nil
 }
 
 // next plays the following track, asking [Config.Autoplay] when the queue is dry
@@ -436,15 +538,19 @@ func (p *Player) SetTape(ctx context.Context, tape *lavalink.Tape) error {
 }
 
 // PreBuffer names the successor so the node can overlap the two. Done on every
-// track start; call it again after editing the queue. Needs a Kairo node.
+// track start and after every queue change; call it again after editing the
+// queue. Needs a Kairo node.
 func (p *Player) PreBuffer(ctx context.Context) error {
 	crossfade := p.Crossfade()
 	if crossfade == nil || !crossfade.Enable {
 		return nil
 	}
 	// A dry queue clears the successor rather than fading into a stale track.
+	// Repeat modes name the looped track, like lavalink-client's
+	// effectiveNextCandidate, so a looped track fades into itself instead of
+	// cutting or stalling.
 	update := lavalink.PlayerUpdate{Crossfade: lavalink.Value(*crossfade), NextTrack: lavalink.Null[lavalink.UpdateTrack]()}
-	if next, ok := p.queue.Peek(); ok {
+	if next, ok := p.effectiveNext(); ok {
 		update.NextTrack = lavalink.Value(lavalink.UpdateTrack{Encoded: lavalink.Value(next.Encoded), UserData: next.UserData})
 	}
 	return p.update(ctx, update)

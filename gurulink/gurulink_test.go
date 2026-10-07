@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/appujet/gurulink/lavalink"
 	"github.com/gorilla/websocket"
@@ -252,15 +253,36 @@ func TestPlayerOverrides(t *testing.T) {
 }
 
 // TestSkipCrossfade covers the manual skip: with crossfade on the request asks
-// for a transition and the queue waits for TrackPromotedEvent.
+// for a transition and the queue waits for TrackEndEvent (crossfade), like
+// lavalink-client — not for TrackPromotedEvent, which is state-sync only.
 func TestSkipCrossfade(t *testing.T) {
 	client := testClient(t, func(c *Config) { c.Crossfade = &lavalink.Crossfade{Enable: true} })
-	bodies := make(chan []byte, 4)
+	bodies := make(chan []byte, 16)
 	player := newPlayer(client, testNode(t, client, bodies), "g")
 
 	ctx := context.Background()
 	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "playing"})
 	player.queue.Add(ctx, lavalink.Track{Encoded: "next"})
+	// Drain the debounced PreBuffer from the Add above: the Skip below must be
+	// the next body read, not the sync.
+	drain := func() {
+		for {
+			select {
+			case <-bodies:
+			default:
+				return
+			}
+		}
+	}
+	// The Add's PreBuffer fires 50ms later; wait it out so the channel is
+	// empty before the Skip.
+	select {
+	case <-bodies:
+		// A PreBuffer slipped in early; keep draining.
+		drain()
+	case <-time.After(100 * time.Millisecond):
+		drain()
+	}
 
 	if err := player.Skip(ctx); err != nil {
 		t.Fatal(err)
@@ -275,7 +297,26 @@ func TestSkipCrossfade(t *testing.T) {
 		t.Errorf("the skip request %s replaces the track instead of fading into it", body)
 	}
 	if current := player.queue.Current(); current == nil || current.Encoded != "playing" {
-		t.Errorf("the queue moved before the node promoted the track: %v", current)
+		t.Errorf("the queue moved before the node ended the track: %v", current)
+	}
+
+	// The node ends the outgoing track with reason crossfade: the queue must
+	// advance to the successor here, so Now Playing matches what is audible.
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "playing"}, Reason: lavalink.ReasonCrossfade})
+	if current := player.queue.Current(); current == nil || current.Encoded != "next" {
+		t.Errorf("the queue did not advance on the crossfade end: %v", current)
+	}
+	if n := player.queue.Len(); n != 0 {
+		t.Errorf("the queue still holds %d tracks after advancing", n)
+	}
+
+	// The following promotion is state-sync only and must not advance again.
+	player.handle(ctx, &TrackPromotedEvent{Player: player, Track: lavalink.Track{Encoded: "next"}})
+	if current := player.queue.Current(); current == nil || current.Encoded != "next" {
+		t.Errorf("the promotion moved the queue a second time: %v", current)
+	}
+	if n := player.queue.Len(); n != 0 {
+		t.Errorf("the promotion duplicated the queue: %d tracks", n)
 	}
 
 	// Crossfade off: the same skip has to replace the track itself.
@@ -283,11 +324,105 @@ func TestSkipCrossfade(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-bodies // SetCrossfade's own request.
+	player.queue.Add(ctx, lavalink.Track{Encoded: "after"})
+	drain()
+	// Wait out the Add's debounced sync before the next Skip.
+	select {
+	case <-bodies:
+		drain()
+	case <-time.After(100 * time.Millisecond):
+		drain()
+	}
 	if err := player.Skip(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if body := string(<-bodies); !strings.Contains(body, `"track":{"encoded":"next"}`) {
+	if body := string(<-bodies); !strings.Contains(body, `"track":{"encoded":"after"}`) {
 		t.Errorf("the skip request %s does not play the next track", body)
+	}
+}
+
+// TestTransitionEndAdvances covers the natural crossfade: a track ending with
+// reason crossfade/gapless must retire the outgoing track and make the head
+// current, without a play request — the node is already playing the successor.
+func TestTransitionEndAdvances(t *testing.T) {
+	client := testClient(t, func(c *Config) { c.Crossfade = &lavalink.Crossfade{Enable: true} })
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "two"}, lavalink.Track{Encoded: "three"})
+
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "one"}, Reason: lavalink.ReasonGapless})
+	if current := player.queue.Current(); current == nil || current.Encoded != "two" {
+		t.Fatalf("the queue did not advance on the gapless end: %v", current)
+	}
+	if got := player.queue.Tracks(); len(got) != 1 || got[0].Encoded != "three" {
+		t.Fatalf("the waiting list is wrong after the transition: %v", got)
+	}
+	if prev := player.queue.Previous(); len(prev) != 1 || prev[0].Encoded != "one" {
+		t.Fatalf("the outgoing track was not retired to history: %v", prev)
+	}
+}
+
+// TestTransitionEndRepeatTrack covers looping one track through a crossfade:
+// without an explicit skip the current track must stay current, not advance
+// into the queue (which would break the loop and show the wrong Now Playing).
+func TestTransitionEndRepeatTrack(t *testing.T) {
+	client := testClient(t, func(c *Config) { c.Crossfade = &lavalink.Crossfade{Enable: true} })
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+	player.SetRepeat(RepeatTrack)
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "loop"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "other"})
+
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "loop"}, Reason: lavalink.ReasonCrossfade})
+	if current := player.queue.Current(); current == nil || current.Encoded != "loop" {
+		t.Fatalf("a looped track advanced on its crossfade end: %v", current)
+	}
+	if n := player.queue.Len(); n != 1 {
+		t.Fatalf("a looped track dropped the queue: %d tracks", n)
+	}
+
+	// An explicit skip still leaves the loop, like lavalink-client's
+	// internal_manualSkipPending.
+	if err := player.Skip(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-bodies // Skip's transition request.
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "loop"}, Reason: lavalink.ReasonCrossfade})
+	if current := player.queue.Current(); current == nil || current.Encoded != "other" {
+		t.Fatalf("an explicit skip did not leave the loop: %v", current)
+	}
+}
+
+// TestPromotedMismatchDropsDuplicate covers the queue moving under the
+// pre-buffer: an AddNext between PreBuffer and promotion must not leave the
+// promoted track duplicated in the waiting list to replay later.
+func TestPromotedMismatchDropsDuplicate(t *testing.T) {
+	client := testClient(t, func(c *Config) { c.Crossfade = &lavalink.Crossfade{Enable: true} })
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "two"}, lavalink.Track{Encoded: "three"})
+	// The head moves after the node pre-buffered "two".
+	player.queue.AddNext(ctx, lavalink.Track{Encoded: "zero"})
+
+	player.handle(ctx, &TrackPromotedEvent{Player: player, Track: lavalink.Track{Encoded: "two"}})
+	if current := player.queue.Current(); current == nil || current.Encoded != "two" {
+		t.Fatalf("the promotion did not take the node's word: %v", current)
+	}
+	for _, got := range player.queue.Tracks() {
+		if got.Encoded == "two" {
+			t.Fatalf("the promoted track was left in the queue to replay: %v", player.queue.Tracks())
+		}
+	}
+	if got := player.queue.Tracks(); len(got) != 2 || got[0].Encoded != "zero" || got[1].Encoded != "three" {
+		t.Fatalf("the waiting list is wrong after the promotion: %v", got)
 	}
 }
 

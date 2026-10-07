@@ -118,6 +118,11 @@ func (p *Player) Destroy(ctx context.Context, reason DestroyReason) error {
 		p.idleTimer.Stop()
 		p.idleTimer = nil
 	}
+	if p.nextSyncTimer != nil {
+		p.nextSyncTimer.Stop()
+		p.nextSyncTimer = nil
+	}
+	p.nextSyncGen++
 	node := p.node
 	p.mu.Unlock()
 

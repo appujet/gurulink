@@ -63,6 +63,21 @@ type Queue struct {
 	tracks   []lavalink.Track
 }
 
+// OnChange returns the queue-change callback, if any.
+func (q *Queue) OnChange() func(ctx context.Context, guildID string, change Change, tracks []lavalink.Track) {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.onChange
+}
+
+// SetOnChange replaces the queue-change callback. It runs after every change,
+// outside the lock.
+func (q *Queue) SetOnChange(f func(ctx context.Context, guildID string, change Change, tracks []lavalink.Track)) {
+	q.mu.Lock()
+	q.onChange = f
+	q.mu.Unlock()
+}
+
 // New builds an empty queue. [Queue.Load] fills it from the store.
 func New(guildID string, cfg Config) *Queue {
 	if cfg.Logger == nil {
@@ -303,8 +318,11 @@ func (q *Queue) Back(ctx context.Context) (lavalink.Track, bool) {
 // callers pass tracks out of events listeners still hold.
 func (q *Queue) SetCurrent(ctx context.Context, t *lavalink.Track) {
 	q.mu.Lock()
-	// Advance already made it current and play sets it again: one write, not two.
-	if q.current == t || (q.current != nil && t != nil && q.current.Encoded == t.Encoded) {
+	// Advance already made it current and play sets it again: one write, not
+	// two. The same song queued twice carries a different requester in
+	// UserData, so equal encodings still update when the tag differs —
+	// otherwise Now Playing keeps the previous requester's name.
+	if q.current == t || (q.current != nil && t != nil && q.current.Encoded == t.Encoded && string(q.current.UserData) == string(t.UserData)) {
 		q.mu.Unlock()
 		return
 	}
