@@ -118,7 +118,7 @@ type TrackStuckEvent struct {
 }
 
 // WebSocketClosedEvent is Discord hanging up on the node's voice connection.
-// 4006, 4009 and 4014 make the player rebuild the session.
+// 4006 and 4009 make the player leave and rejoin to get a fresh session.
 type WebSocketClosedEvent struct {
 	Player   *Player `json:"-"`
 	Code     int     `json:"code"`

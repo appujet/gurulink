@@ -137,8 +137,7 @@ func (p *Player) trackFailed() bool {
 func (p *Player) voiceClosed(code int) {
 	switch code {
 	case CloseCodeDisconnected:
-		// Kicked, moved out, or the channel is gone: there is nothing to rejoin.
-		go p.background(func(ctx context.Context) error { return p.Destroy(ctx, DestroyVoiceClosed) })
+		return
 
 	case CloseCodeSessionInvalid, CloseCodeSessionExpired:
 		p.mu.RLock()
