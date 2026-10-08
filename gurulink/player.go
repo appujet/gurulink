@@ -57,41 +57,73 @@ const (
 // Lock order: never take p.mu while holding the queue's lock; node calls happen
 // outside p.mu.
 type Player struct {
-	client         *Client
-	guildID        string
-	queue          *queue.Queue
-	log            *slog.Logger
-	cmdMu          sync.Mutex
-	mu             sync.RWMutex
-	node           *Node
-	channelID      string
-	selfMute       bool
-	selfDeaf       bool
-	serverMute     bool
-	serverDeaf     bool
-	suppress       bool
-	voice          lavalink.VoiceState
-	state          lavalink.PlayerState
-	stateAt        time.Time
-	volume         int
-	paused         bool
-	filters        lavalink.Filters
-	repeat         RepeatMode
-	crossfade      *lavalink.Crossfade
-	tape           *lavalink.Tape
-	idleTimer      *time.Timer
-	destroyed      bool
-	data           map[string]any
-	playing        bool
-	manualSkip     bool
-	skipped        bool
-	stopPlaying    bool
-	nodeChanging   bool
-	filtersDirty   bool
-	errorAt        []time.Time
+	client     *Client
+	guildID    string
+	queue      *queue.Queue
+	log        *slog.Logger
+	cmdMu      sync.Mutex
+	mu         sync.RWMutex
+	node       *Node
+	channelID  string
+	selfMute   bool
+	selfDeaf   bool
+	serverMute bool
+	serverDeaf bool
+	suppress   bool
+	voice      lavalink.VoiceState
+	state      lavalink.PlayerState
+	stateAt    time.Time
+	volume     int
+	paused     bool
+	filters    lavalink.Filters
+	repeat     RepeatMode
+	crossfade  *lavalink.Crossfade
+	tape       *lavalink.Tape
+	idleTimer  *time.Timer
+	destroyed  bool
+	data       map[string]any
+	// inCommand says a command holds cmdMu, so callbacks into user code wait in
+	// pending until it is free. See [Player.cmd].
+	inCommand bool
+	pending   []func()
+	// playing is the node's word for "a track is decoding", kept across a pause
+	// like lavalink-client's player.playing. [Player.Playing] is the narrower
+	// public question and stays derived.
+	playing bool
+
+	// These five mirror lavalink-client's internal_* player data: one-shot
+	// intents a command leaves behind for the event that follows it.
+	//
+	// manualSkip is internal_manualSkipPending: an explicit skip through a
+	// crossfade transition, so the following TrackEnd advances past RepeatTrack.
+	manualSkip bool
+	// skipped is internal_skipped: a skip stopped the track, so the following
+	// TrackEnd (stopped) advances instead of being ignored.
+	skipped bool
+	// stopPlaying is internal_stopPlaying: a Stop did, so that same reason ends
+	// the queue instead.
+	stopPlaying bool
+	// nodeChanging is internal_nodeChanging: silence the track events while the
+	// player is rebuilt elsewhere, so the old node's events cannot drive it.
+	nodeChanging bool
+	// filtersDirty is FilterManager.filterUpdatedState: ask the next
+	// playerUpdate for one re-seek, because a filter change can leave the node
+	// decoding from a stale position.
+	filtersDirty bool
+
+	// errorAt is internal_erroredTracksTimestamps, a sliding window: failures
+	// expire, so a long-lived player is not torn down by errors hours apart.
+	errorAt []time.Time
+	// autoplaying and autoplayFailed are internal_autoplay_in_progress and
+	// internal_autoplay_failed_at: no re-entry, and no retry storm against a
+	// source that is down.
 	autoplaying    bool
 	autoplayFailed time.Time
-	// win the race against the delayed sync.
+
+	// nextSyncTimer debounces NextTrack re-syncs after queue edits, like
+	// lavalink-client's scheduleNextTrackSync (50ms): rapid edits coalesce into
+	// one node call, and the generation lets a later edit cancel an earlier
+	// sync that is still resolving.
 	nextSyncTimer *time.Timer
 	nextSyncGen   int
 }
@@ -117,7 +149,11 @@ func newPlayer(client *Client, node *Node, guildID string) *Player {
 	outer := p.queue.OnChange()
 	p.queue.SetOnChange(func(ctx context.Context, guildID string, change queue.Change, tracks []lavalink.Track) {
 		if outer != nil {
-			outer(ctx, guildID, change, tracks)
+			// Held until the command lock is free, for the same reason events
+			// are: a now-playing handler that calls back into the player must
+			// not deadlock against the command that changed the queue. The
+			// store's own write stays inline, so persistence order is kept.
+			p.notify(func() { outer(ctx, guildID, change, tracks) })
 		}
 		if change == queue.Current {
 			return
@@ -287,6 +323,21 @@ func (p *Player) absorb(info lavalink.PlayerInfo) {
 		return
 	}
 	p.volume, p.paused, p.filters = info.Volume, info.Paused, info.Filters
+	// Take the node's word for the transition settings too. It reports what is
+	// actually in effect, with its own defaults filled in, and trusting the
+	// local cache instead is what let a player claim crossfade was on while the
+	// node was running its own configuration. lavalink-client mirrors
+	// res.crossfade for the same reason. Stock Lavalink never sends the field,
+	// which leaves the override alone.
+	if !info.Crossfade.IsZero() {
+		if crossfade, ok := info.Crossfade.Get(); ok {
+			p.crossfade = &crossfade
+		} else {
+			// Explicitly null: no transitions, and not a reason to fall back to
+			// Config.Crossfade.
+			p.crossfade = &lavalink.Crossfade{}
+		}
+	}
 }
 
 // markPosition moves the local timeline without waiting for the node, the way
@@ -320,12 +371,62 @@ func (p *Player) resetStateClock() {
 	p.mu.Unlock()
 }
 
+// cmdKey marks a context as already running inside a player's command.
+type cmdKey struct{}
+
 // cmd runs a track-changing command under cmdMu. Every path that edits the queue
 // and tells the node about it in the same breath goes through here.
+//
+// User code never runs with the lock held: events and [Config.OnQueueChange] are
+// held in p.pending and flushed once it is free, because a listener that calls
+// back into the player would otherwise deadlock against the very command that
+// triggered it — a QueueEndEvent handler calling Play is the obvious case.
+// [Config.Autoplay] has to run inline, so it is covered by the context token
+// instead.
 func (p *Player) cmd(ctx context.Context, f func(context.Context) error) error {
+	// Already inside this player's command on this call path: re-entering is
+	// safe and must not block, so run inline rather than wait for a lock this
+	// goroutine is holding.
+	if ctx.Value(cmdKey{}) == p {
+		return f(ctx)
+	}
 	p.cmdMu.Lock()
-	defer p.cmdMu.Unlock()
-	return f(ctx)
+	p.mu.Lock()
+	p.inCommand = true
+	p.mu.Unlock()
+
+	// Flushed on the way out, panic or not, and only once the lock is free.
+	defer func() {
+		p.mu.Lock()
+		p.inCommand = false
+		pending := p.pending
+		p.pending = nil
+		p.mu.Unlock()
+		p.cmdMu.Unlock()
+		for _, notify := range pending {
+			notify()
+		}
+	}()
+	return f(context.WithValue(ctx, cmdKey{}, p))
+}
+
+// notify runs a callback into user code, held until the command lock is free
+// when one is held. See [Player.cmd].
+func (p *Player) notify(f func()) {
+	p.mu.Lock()
+	if p.inCommand {
+		p.pending = append(p.pending, f)
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
+	f()
+}
+
+// emit sends a player event to the client's listeners, held while a command is
+// running so a listener can call straight back into the player.
+func (p *Player) emit(event Event) {
+	p.notify(func() { p.client.emit(event) })
 }
 
 // goCmd runs one off the node's read loop, which must never block on a request.
@@ -470,7 +571,7 @@ func (p *Player) Pause(ctx context.Context, pause bool) error {
 	}
 	// The node's reply is the truth; a no-op pause stays quiet.
 	if now := p.Paused(); now != was {
-		p.client.emit(&PlayerPauseEvent{Player: p, Paused: now})
+		p.emit(&PlayerPauseEvent{Player: p, Paused: now})
 	}
 	return nil
 }
@@ -668,7 +769,7 @@ func (p *Player) autoplay(ctx context.Context) bool {
 	p.mu.Unlock()
 
 	if err != nil {
-		p.client.emit(&ErrorEvent{Node: p.Node(), Err: fmt.Errorf("gurulink: autoplay: %w", err)})
+		p.emit(&ErrorEvent{Node: p.Node(), Err: fmt.Errorf("gurulink: autoplay: %w", err)})
 	}
 	return grew
 }
@@ -692,7 +793,7 @@ func (p *Player) next(ctx context.Context, reason lavalink.TrackEndReason) error
 	if ended != nil {
 		last = *ended
 	}
-	p.client.emit(&QueueEndEvent{Player: p, Track: last, Reason: reason})
+	p.emit(&QueueEndEvent{Player: p, Track: last, Reason: reason})
 	// Skipping the last track has to stop the audio.
 	return p.update(ctx, lavalink.PlayerUpdate{Track: &lavalink.UpdateTrack{Encoded: lavalink.Null[string]()}})
 }

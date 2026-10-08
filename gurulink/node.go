@@ -291,8 +291,47 @@ func (n *Node) disconnected(err error) {
 		slog.Int("code", code), slog.String("reason", reason))
 	n.client.emit(&DisconnectEvent{Node: n, Code: code, Reason: reason})
 
+	go n.stranded()
+
 	if !expected && !n.client.stopped() {
 		go n.reconnect()
+	}
+}
+
+// stranded reacts to this node's players losing their node. They are silent
+// either way, so stop claiming a track is running; with [Config.AutoMove] they
+// also move somewhere that can play. lavalink-client does both in close(), and
+// leaves a player in place rather than destroying it when nothing can take it
+// over, which is the policy here too.
+//
+// ponytail: moves them one at a time. lavalink-client caps concurrency and
+// reserves slots on the target; add that if a big fleet stampedes one node.
+func (n *Node) stranded() {
+	var players []*Player
+	for _, player := range n.client.Players() {
+		if player.Node() != n {
+			continue
+		}
+		player.setStarted(false)
+		players = append(players, player)
+	}
+	if !n.client.cfg.AutoMove || n.client.stopped() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for _, player := range players {
+		if player.Destroyed() {
+			continue
+		}
+		target := n.client.bestNode(player.Voice().Endpoint)
+		if target == nil || target == n {
+			continue
+		}
+		if err := player.MoveNode(ctx, target); err != nil {
+			n.client.emit(&ErrorEvent{Node: n, Err: fmt.Errorf(
+				"gurulink: move stranded player %s: %w", player.GuildID(), err)})
+		}
 	}
 }
 

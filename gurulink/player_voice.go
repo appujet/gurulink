@@ -31,7 +31,7 @@ func (p *Player) Disconnect(ctx context.Context) error {
 	if err := p.client.cfg.SendVoiceUpdate(ctx, p.guildID, nil, false, false); err != nil {
 		return err
 	}
-	p.client.emit(&PlayerDisconnectEvent{Player: p, ChannelID: channelID})
+	p.emit(&PlayerDisconnectEvent{Player: p, ChannelID: channelID})
 	return nil
 }
 
@@ -53,16 +53,16 @@ func (p *Player) onVoiceState(ctx context.Context, u VoiceStateUpdate) error {
 	p.mu.Unlock()
 
 	if from != u.ChannelID {
-		p.client.emit(&PlayerChannelMoveEvent{Player: p, From: from, To: u.ChannelID})
+		p.emit(&PlayerChannelMoveEvent{Player: p, From: from, To: u.ChannelID})
 	}
 	if muted {
-		p.client.emit(&PlayerMuteChangeEvent{Player: p, SelfMute: u.SelfMute, ServerMute: u.ServerMute})
+		p.emit(&PlayerMuteChangeEvent{Player: p, SelfMute: u.SelfMute, ServerMute: u.ServerMute})
 	}
 	if deafened {
-		p.client.emit(&PlayerDeafChangeEvent{Player: p, SelfDeaf: u.SelfDeaf, ServerDeaf: u.ServerDeaf})
+		p.emit(&PlayerDeafChangeEvent{Player: p, SelfDeaf: u.SelfDeaf, ServerDeaf: u.ServerDeaf})
 	}
 	if suppressed {
-		p.client.emit(&PlayerSuppressChangeEvent{Player: p, Suppress: u.Suppress})
+		p.emit(&PlayerSuppressChangeEvent{Player: p, Suppress: u.Suppress})
 	}
 
 	if !sessionChanged || !voice.Complete() {
@@ -79,10 +79,10 @@ func (p *Player) otherVoiceState(u VoiceStateUpdate) {
 		return
 	}
 	if u.ChannelID == channelID {
-		p.client.emit(&PlayerVoiceJoinEvent{Player: p, UserID: u.UserID})
+		p.emit(&PlayerVoiceJoinEvent{Player: p, UserID: u.UserID})
 		return
 	}
-	p.client.emit(&PlayerVoiceLeaveEvent{Player: p, UserID: u.UserID})
+	p.emit(&PlayerVoiceLeaveEvent{Player: p, UserID: u.UserID})
 }
 
 // onVoiceServer takes Discord's voice server, which hands the connection to a
@@ -133,7 +133,7 @@ func (p *Player) Destroy(ctx context.Context, reason DestroyReason) error {
 		err = errors.Join(err, nerr)
 	}
 	err = errors.Join(err, p.queue.Delete(ctx))
-	p.client.emit(&PlayerDestroyEvent{Player: p, Reason: reason})
+	p.emit(&PlayerDestroyEvent{Player: p, Reason: reason})
 	return err
 }
 
@@ -183,7 +183,7 @@ func (p *Player) moveNode(ctx context.Context, node *Node) error {
 		p.mu.Unlock()
 		return fmt.Errorf("gurulink: move player to %s: %w", node.Name(), err)
 	}
-	p.client.emit(&PlayerNodeMoveEvent{Player: p, From: from, To: node})
+	p.emit(&PlayerNodeMoveEvent{Player: p, From: from, To: node})
 	return nil
 }
 

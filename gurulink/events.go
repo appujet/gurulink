@@ -11,6 +11,10 @@ import (
 type Event any
 
 // Listener gets every event in order, on the node's read loop: keep it quick.
+//
+// Calling back into the player is safe. An event a command produced is held
+// until that command has finished, so a [QueueEndEvent] handler that starts
+// playing again will not deadlock against the command that emitted it.
 type Listener func(e Event)
 
 // On makes a [Listener] that only handles one event type:

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/appujet/gurulink/lavalink"
+	"github.com/appujet/gurulink/queue"
 	"github.com/gorilla/websocket"
 )
 
@@ -550,9 +551,11 @@ func TestSkipWaitsForEnd(t *testing.T) {
 // skip look identical on the wire, so the flag the command leaves behind is the
 // only thing that tells them apart.
 func TestStopDoesNotAdvance(t *testing.T) {
-	var ended int
+	// Events reach listeners once the command lock is free, so wait for the
+	// event rather than reading a counter the listener writes from elsewhere.
+	ended := make(chan *QueueEndEvent, 4)
 	client := testClient(t, func(c *Config) {
-		c.Listeners = []Listener{On(func(e *QueueEndEvent) { ended++ })}
+		c.Listeners = []Listener{On(func(e *QueueEndEvent) { ended <- e })}
 	})
 	bodies := make(chan []byte, 16)
 	player := newPlayer(client, testNode(t, client, bodies), "g")
@@ -570,11 +573,21 @@ func TestStopDoesNotAdvance(t *testing.T) {
 	if body := string(<-bodies); !strings.Contains(body, `"track":{"encoded":null}`) {
 		t.Errorf("a stopped player played something: %s", body)
 	}
+	select {
+	case e := <-ended:
+		if e.Reason != lavalink.ReasonStopped {
+			t.Errorf("the queue ended with reason %q, want stopped", e.Reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the queue end never fired")
+	}
 	if current := player.queue.Current(); current != nil {
 		t.Errorf("a stopped player still has a current track: %v", current)
 	}
-	if ended != 1 {
-		t.Errorf("the queue end fired %d times, want 1", ended)
+	select {
+	case <-ended:
+		t.Error("the queue end fired more than once")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -1075,5 +1088,268 @@ func TestAutoplayNotReentered(t *testing.T) {
 	player.autoplay(context.Background())
 	if calls != 1 {
 		t.Errorf("autoplay was re-entered: ran %d times, want 1", calls)
+	}
+}
+
+// TestDestroyedPlayerIgnoresTrackEvents covers events arriving after a teardown:
+// every command they could start fails anyway, and a queue edit would still
+// reach Config.OnQueueChange after the destroy event went out.
+func TestDestroyedPlayerIgnoresTrackEvents(t *testing.T) {
+	var changes int
+	client := testClient(t, func(c *Config) {
+		c.OnQueueChange = func(context.Context, string, queue.Change, []lavalink.Track) { changes++ }
+	})
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+	client.players["g"] = player
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "two"})
+	if err := player.Destroy(ctx, DestroyRequested); err != nil {
+		t.Fatal(err)
+	}
+	drained := changes
+	// Destroy's own DELETE lands in bodies with an empty body; drain it so the
+	// check below only sees requests the events caused.
+	for len(bodies) > 0 {
+		<-bodies
+	}
+
+	for _, event := range []Event{
+		&TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "one"}, Reason: lavalink.ReasonFinished},
+		&TrackStartEvent{Player: player, Track: lavalink.Track{Encoded: "two"}},
+		&TrackPromotedEvent{Player: player, Track: lavalink.Track{Encoded: "two"}},
+		&TrackStuckEvent{Player: player, Track: lavalink.Track{Encoded: "one"}},
+	} {
+		player.handle(ctx, event)
+	}
+	if changes != drained {
+		t.Errorf("a destroyed player reported %d queue changes after the teardown", changes-drained)
+	}
+	select {
+	case body := <-bodies:
+		t.Errorf("a destroyed player sent a request: %s", body)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestStrandedPlayersStopPlaying covers a node drop: its players are silent, so
+// the player must stop claiming a track is running. lavalink-client clears
+// player.playing in close() for the same reason.
+func TestStrandedPlayersStopPlaying(t *testing.T) {
+	client := testClient(t, nil)
+	node := testNode(t, client, make(chan []byte, 16))
+	player := newPlayer(client, node, "g")
+	client.players["g"] = player
+
+	player.setStarted(true)
+	if !player.started() {
+		t.Fatal("setup: expected a started player")
+	}
+	node.stranded()
+	if player.started() {
+		t.Error("a player whose node dropped still claims to be playing")
+	}
+}
+
+// TestStrandedPlayersStayPutWithoutANode covers the freeze policy: with nothing
+// to move to, a player is left in place for the reconnect rather than destroyed.
+func TestStrandedPlayersStayPutWithoutANode(t *testing.T) {
+	client := testClient(t, func(c *Config) { c.AutoMove = true })
+	node := testNode(t, client, make(chan []byte, 16))
+	player := newPlayer(client, node, "g")
+	client.players["g"] = player
+	player.queue.SetCurrent(context.Background(), &lavalink.Track{Encoded: "one"})
+
+	node.stranded()
+
+	if player.Destroyed() {
+		t.Error("a stranded player with nowhere to go was destroyed instead of frozen")
+	}
+	if player.Node() != node {
+		t.Error("a stranded player was moved to a node that cannot take it")
+	}
+	if current := player.queue.Current(); current == nil || current.Encoded != "one" {
+		t.Errorf("a stranded player lost its queue: %v", current)
+	}
+}
+
+// TestCallbacksCanCallBackIn is the deadlock guard. Commands serialise on a
+// lock, and they are what trigger events and queue-change callbacks, so user
+// code calling a command from inside one used to wait on a lock its own
+// goroutine was holding — forever. A QueueEndEvent handler that starts playing
+// again is the obvious case and the most common bot pattern there is.
+//
+// Each case signals only after its nested command RETURNS, so a deadlock shows
+// up as a timeout rather than a leaked goroutine nobody waits on.
+func TestCallbacksCanCallBackIn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// arm installs the callback. It resolves the player lazily through get,
+		// because OnQueueChange has to be set before the player is built, and
+		// calls done once its nested command returns.
+		arm     func(client *Client, get func() *Player, done func())
+		trigger func(player *Player)
+	}{
+		{
+			// next() emits QueueEndEvent while it holds the lock.
+			name: "queue end listener plays",
+			arm: func(client *Client, get func() *Player, done func()) {
+				client.AddListener(On(func(e *QueueEndEvent) {
+					_ = e.Player.Play(context.Background(), lavalink.Track{Encoded: "rescue"})
+					done()
+				}))
+			},
+			trigger: func(player *Player) {
+				ctx := context.Background()
+				player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "last"})
+				player.handle(ctx, &TrackEndEvent{
+					Player: player,
+					Track:  lavalink.Track{Encoded: "last"},
+					Reason: lavalink.ReasonFinished,
+				})
+			},
+		},
+		{
+			// play() emits IdleCancelEvent while it holds the lock.
+			name: "idle listener stops",
+			arm: func(client *Client, get func() *Player, done func()) {
+				client.AddListener(On(func(e *IdleCancelEvent) {
+					_ = e.Player.Stop(context.Background())
+					done()
+				}))
+			},
+			trigger: func(player *Player) {
+				player.startIdle()
+				_ = player.Play(context.Background(), lavalink.Track{Encoded: "one"})
+			},
+		},
+		{
+			// Every queue edit inside a command runs OnQueueChange.
+			name: "queue change handler skips",
+			arm: func(client *Client, get func() *Player, done func()) {
+				client.cfg.OnQueueChange = func(context.Context, string, queue.Change, []lavalink.Track) {
+					if player := get(); player != nil {
+						_ = player.Skip(context.Background())
+						done()
+					}
+				}
+			},
+			trigger: func(player *Player) {
+				ctx := context.Background()
+				player.queue.Add(ctx, lavalink.Track{Encoded: "two"})
+				_ = player.Play(ctx, lavalink.Track{Encoded: "one"})
+			},
+		},
+		{
+			// Autoplay runs inline, so it relies on the context token instead.
+			name: "autoplay plays with its own ctx",
+			arm: func(client *Client, get func() *Player, done func()) {
+				client.cfg.Autoplay = func(ctx context.Context, p *Player) error {
+					// The ctx it was handed marks the running command, so this
+					// re-enters rather than waiting on the lock.
+					err := p.Play(ctx, lavalink.Track{Encoded: "auto"})
+					done()
+					return err
+				}
+			},
+			trigger: func(player *Player) {
+				ctx := context.Background()
+				player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "last"})
+				player.handle(ctx, &TrackEndEvent{
+					Player: player,
+					Track:  lavalink.Track{Encoded: "last"},
+					Reason: lavalink.ReasonFinished,
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bodies := make(chan []byte, 256)
+			go func() {
+				for range bodies {
+				}
+			}()
+			client := testClient(t, func(c *Config) { c.EmptyQueueTimeout = time.Hour })
+			node := testNode(t, client, bodies)
+
+			reached := make(chan struct{})
+			var once sync.Once
+			done := func() { once.Do(func() { close(reached) }) }
+
+			var mu sync.Mutex
+			var target *Player
+			tc.arm(client, func() *Player {
+				mu.Lock()
+				defer mu.Unlock()
+				return target
+			}, done)
+
+			player := newPlayer(client, node, "g")
+			mu.Lock()
+			target = player
+			mu.Unlock()
+			client.players["g"] = player
+
+			go tc.trigger(player)
+
+			select {
+			case <-reached:
+			case <-time.After(5 * time.Second):
+				t.Fatal("deadlocked: a callback called a command and it never returned")
+			}
+		})
+	}
+}
+
+// TestCrossfadeMirrorsNode covers the node's word winning over the local cache.
+// A Kairo node reports the transition settings actually in effect, with its own
+// defaults filled in; trusting the cache instead is what let a player claim
+// crossfade was on while the node ran its own configuration.
+func TestCrossfadeMirrorsNode(t *testing.T) {
+	client := testClient(t, func(c *Config) {
+		c.Crossfade = &lavalink.Crossfade{Enable: true, DurationMs: 1000}
+	})
+	player := newPlayer(client, &Node{cfg: NodeConfig{Name: "test"}, client: client, log: client.Logger()}, "g")
+
+	// What the node says is in effect, including a field we never sent.
+	player.absorb(lavalink.PlayerInfo{
+		Volume: 100,
+		Crossfade: lavalink.Value(lavalink.Crossfade{
+			Enable: true, DurationMs: 3000, ManualDurationMs: 3500, Curve: lavalink.CrossfadeSCurve,
+		}),
+	})
+	got := player.Crossfade()
+	if got == nil || got.DurationMs != 3000 || got.Curve != lavalink.CrossfadeSCurve {
+		t.Fatalf("the node's settings were not mirrored: %+v", got)
+	}
+	if !player.crossfading() {
+		t.Error("the mirrored settings should still count as crossfading")
+	}
+
+	// Explicitly null means no transitions, and must not fall back to the
+	// client-wide setting.
+	player.absorb(lavalink.PlayerInfo{Volume: 100, Crossfade: lavalink.Null[lavalink.Crossfade]()})
+	if player.crossfading() {
+		t.Error("a node reporting no transitions should turn crossfading off, not fall back")
+	}
+}
+
+// TestCrossfadeUntouchedByStockNode covers the other side: stock Lavalink never
+// sends the field, so the local override has to survive every reply.
+func TestCrossfadeUntouchedByStockNode(t *testing.T) {
+	client := testClient(t, nil)
+	player := newPlayer(client, &Node{cfg: NodeConfig{Name: "test"}, client: client, log: client.Logger()}, "g")
+
+	player.mu.Lock()
+	player.crossfade = &lavalink.Crossfade{Enable: true, DurationMs: 1500}
+	player.mu.Unlock()
+
+	// A reply with no crossfade field at all.
+	player.absorb(lavalink.PlayerInfo{Volume: 100})
+	got := player.Crossfade()
+	if got == nil || !got.Enable || got.DurationMs != 1500 {
+		t.Errorf("a stock node's reply clobbered the override: %+v", got)
 	}
 }

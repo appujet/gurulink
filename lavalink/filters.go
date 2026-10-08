@@ -25,7 +25,8 @@ type Filters struct {
 }
 
 // Active reports whether any filter is set, so whether the node is doing DSP.
-// Seeking with filters on needs the node nudged twice; this keys that.
+// A filter change can leave the node decoding from a stale position, so this
+// keys the single re-seek the next playerUpdate performs.
 func (f Filters) Active() bool {
 	return f.Volume != nil || f.Equalizer != nil || f.Karaoke != nil ||
 		f.Timescale != nil || f.Tremolo != nil || f.Vibrato != nil ||

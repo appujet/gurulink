@@ -32,7 +32,7 @@ func (p *Player) startIdle() {
 		}
 	})
 	p.mu.Unlock()
-	p.client.emit(&IdleStartEvent{Player: p, Timeout: timeout})
+	p.emit(&IdleStartEvent{Player: p, Timeout: timeout})
 }
 
 // stopIdle disarms the countdown.
@@ -45,7 +45,7 @@ func (p *Player) stopIdle() {
 	}
 	p.mu.Unlock()
 	if armed {
-		p.client.emit(&IdleCancelEvent{Player: p})
+		p.emit(&IdleCancelEvent{Player: p})
 	}
 }
 
@@ -56,8 +56,8 @@ func (p *Player) handle(ctx context.Context, event Event) {
 	// node's events: they describe a player that is about to be destroyed, and
 	// letting one advance the queue would drive it against the new node
 	// mid-rebuild. lavalink-client gates the same handlers on
-	// internal_nodeChanging.
-	if p.changingNode() {
+
+	if p.changingNode() || p.Destroyed() {
 		switch event.(type) {
 		case *TrackStartEvent, *TrackPromotedEvent, *TrackEndEvent, *TrackStuckEvent:
 			return
@@ -258,7 +258,7 @@ func (p *Player) voiceClosed(code int) {
 		if channelID == "" {
 			return
 		}
-		p.client.emit(&PlayerReconnectEvent{Player: p, ChannelID: channelID})
+		p.emit(&PlayerReconnectEvent{Player: p, ChannelID: channelID})
 		// Only leaving and rejoining makes Discord hand out a new session.
 		go p.background(func(ctx context.Context) error {
 			if err := p.Disconnect(ctx); err != nil {
@@ -280,6 +280,6 @@ func (p *Player) background(f func(ctx context.Context) error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := f(ctx); err != nil && !errors.Is(err, ErrPlayerDestroyed) {
-		p.client.emit(&ErrorEvent{Node: p.Node(), Err: fmt.Errorf("gurulink: player %s: %w", p.guildID, err)})
+		p.emit(&ErrorEvent{Node: p.Node(), Err: fmt.Errorf("gurulink: player %s: %w", p.guildID, err)})
 	}
 }

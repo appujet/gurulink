@@ -34,11 +34,10 @@ type Config struct {
 	QueueStore queue.Store
 	// OnQueueChange is told about every queue change, for a now-playing message.
 	//
-	// It runs inside the change, which can be inside a player command, so it
-	// must not call a player method that changes the track ([Player.Play],
-	// [Player.Skip], [Player.Stop], [Player.Back], [Player.SkipTo],
-	// [Player.MoveNode]): those serialise against the command already running
-	// and the call would block forever. Read the player, or start a goroutine.
+	// It is free to call back into the player: a change made inside a command
+	// reaches it once that command has finished, so [Player.Skip] and friends
+	// will not deadlock against it. That also means it can run slightly after
+	// the change it describes.
 	OnQueueChange func(ctx context.Context, guildID string, change queue.Change, tracks []lavalink.Track)
 
 	// Autoplay is asked for more tracks when a queue runs dry, before
@@ -48,10 +47,11 @@ type Config struct {
 	// something to fade into. It is never called twice at once, and a call that
 	// adds nothing is not retried for [Config.AutoplayCooldown].
 	//
-	// Add tracks with [queue.Queue.Add] and return. It runs inside the command
-	// that needs the tracks, so calling a player method that changes the track
-	// ([Player.Play], [Player.Skip], ...) would block forever against the
-	// command already running.
+	// Unlike the events, this runs inside the command that needs the tracks, so
+	// pass the ctx it was handed to any player method you call: that ctx marks
+	// the running command and lets the call through. Calling one with a fresh
+	// context (such as [context.Background]) would wait on a lock this goroutine
+	// already holds. Adding to the queue is always safe.
 	Autoplay func(ctx context.Context, player *Player) error
 	// AutoplayCooldown is how long to leave [Config.Autoplay] alone after a call
 	// that added no tracks, so a source that is down is not asked once per track.
@@ -78,6 +78,7 @@ type Config struct {
 	// ReconnectDelay grows with the attempt number, capped at a minute. Defaults
 	// to 5s.
 	ReconnectDelay time.Duration
+	AutoMove       bool
 
 	// Crossfade overlaps tracks by pre-buffering the next. Needs a Kairo node;
 	// [Player.SetCrossfade] overrides it per player.

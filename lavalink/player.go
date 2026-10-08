@@ -34,6 +34,12 @@ type PlayerInfo struct {
 	State   PlayerState `json:"state"`
 	Voice   VoiceState  `json:"voice"`
 	Filters Filters     `json:"filters"`
+
+	// Crossfade is the transition setting actually in effect, which a Kairo node
+	// reports back with its own defaults filled in. Absent from stock Lavalink,
+	// which is why it is nullable: null means the node is doing no transitions
+	// at all, missing means it never said.
+	Crossfade Nullable[Crossfade] `json:"crossfade,omitzero"`
 }
 
 // UpdateTrack selects the track to play. A null Encoded (see [Null]) stops
