@@ -76,7 +76,7 @@ func (p *Player) handle(ctx context.Context, event Event) {
 		// The successor starts from the top. Without this Position() reports the
 		// outgoing track's elapsed time against it, so a Now Playing progress
 		// bar is wrong until the next playerUpdate.
-		p.restart(true)
+		p.restart()
 		p.adopt(ctx, e.Track)
 
 	case *TrackEndEvent:
@@ -158,7 +158,13 @@ func (p *Player) endedTransition(ctx context.Context, e *TrackEndEvent) {
 	// restarts here. Frozen rather than ticking: lavalink-client nulls
 	// lastPositionChange in this branch and lets the next playerUpdate start the
 	// clock.
-	p.restart(false)
+	// The successor is already audible from its own start, so the timeline
+	// restarts here and keeps running. lavalink-client nulls lastPositionChange
+	// in this branch, which freezes Position() at zero until the next
+	// playerUpdate — but the node keeps the successor active through a
+	// transition end, so audio really is advancing and a frozen clock makes a
+	// relative seek jump to ten seconds from the start of the track.
+	p.restart()
 	// Already moved on (a duplicate end, or a queue that changed under us):
 	// the ended track is no longer current, so there is nothing to retire.
 	if current := p.queue.Current(); current == nil || current.Encoded != e.Track.Encoded {
@@ -192,6 +198,10 @@ func (p *Player) endedTransition(ctx context.Context, e *TrackEndEvent) {
 // heal and the status would name one track while another is audible. It runs on
 // the read loop, so it converges rather than taking the command lock.
 func (p *Player) adopt(ctx context.Context, track lavalink.Track) {
+	// The node has told us what it is playing, so any hand-over is over. This is
+	// the backstop for one that never produced a promoted TrackEnd: without it a
+	// stuck flag would refuse every later seek.
+	p.takeManualSkip()
 	current := p.queue.Current()
 	// Only when the node is playing something unexpected: the queue moved under
 	// the pre-buffer (an AddNext, a removal, a shuffle between PreBuffer and

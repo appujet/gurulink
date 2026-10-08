@@ -348,18 +348,19 @@ func (p *Player) markPosition(position lavalink.Duration) {
 	now := time.Now()
 	p.mu.Lock()
 	p.state.Position, p.stateAt = position, now
-	p.state.Time = lavalink.Timestamp{Time: now}
+	// Millisecond precision on purpose: the wire carries unix millis, so a node
+	// reply generated after this seek still truncates to an earlier instant than
+	// a nanosecond-precision local stamp, and the gate below would reject it —
+	// dropping the volume, pause and filters it carried with it. Stamping at the
+	// same resolution the node uses makes the two directly comparable.
+	p.state.Time = lavalink.Timestamp{Time: time.UnixMilli(now.UnixMilli())}
 	p.mu.Unlock()
 }
 
-func (p *Player) restart(ticking bool) {
+func (p *Player) restart() {
+	now := time.Now()
 	p.mu.Lock()
-	p.state.Position = 0
-	if ticking {
-		p.stateAt = time.Now()
-	} else {
-		p.stateAt = time.Time{}
-	}
+	p.state.Position, p.stateAt = 0, now
 	p.mu.Unlock()
 }
 
@@ -508,6 +509,7 @@ func (p *Player) play(ctx context.Context, track lavalink.Track, noReplace bool)
 	// to do: that end belongs to a track nobody is waiting on any more, and a
 	// flag left set would steer the wrong one.
 	p.takeIntent()
+	p.takeManualSkip()
 	p.queue.SetCurrent(ctx, &track)
 	resume := false
 	update := lavalink.PlayerUpdate{
@@ -583,9 +585,37 @@ func (p *Player) Resume(ctx context.Context) error { return p.Pause(ctx, false) 
 // node reported as not seekable.
 var ErrNotSeekable = errors.New("gurulink: current track is not seekable")
 
+// ErrTransitioning is returned by [Player.Seek] and [Player.SetEndTime] while a
+// crossfade skip is still handing over. See [Player.Transitioning].
+var ErrTransitioning = errors.New("gurulink: a crossfade skip is still completing")
+
+// Transitioning reports whether a crossfade skip is still handing over to its
+// successor, which lasts the crossfade's manual duration and ends with the
+// TrackEnd that promotes it.
+//
+// Two tracks are audible in that window and the node has already moved its own
+// current slot to the successor, so there is no single track a seek could mean.
+// [Player.Seek] and [Player.SetEndTime] report [ErrTransitioning] rather than
+// act on the wrong one; wait for [TrackPromotedEvent] or the [TrackEndEvent]
+// that carries a promoted reason.
+func (p *Player) Transitioning() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.manualSkip
+}
+
 // Seek jumps to a position in the current track. Nothing playing is a no-op; a
 // position past the end is clamped to it.
 func (p *Player) Seek(ctx context.Context, position lavalink.Duration) error {
+	// A crossfade skip hands over by playhead: the node promotes the successor
+	// when the outgoing track reaches the end of the fade window. Seeking moves
+	// that playhead, so a seek here lands on a track the node no longer calls
+	// current and can leave the hand-over unable to finish — after which the
+	// node ignores every further transition until something promotes the one it
+	// is holding. Refuse instead of wedging it.
+	if p.Transitioning() {
+		return ErrTransitioning
+	}
 	// The same three guards as lavalink-client's seek(), so an impossible seek
 	// never reaches the node and comes back as a REST error.
 	current := p.queue.Current()
@@ -612,6 +642,11 @@ func (p *Player) SetVolume(ctx context.Context, volume int) error {
 
 // SetEndTime stops the current track early, at a position in it.
 func (p *Player) SetEndTime(ctx context.Context, end lavalink.Duration) error {
+	// Same reason as [Player.Seek]: an end time is another marker on the
+	// outgoing track's timeline, and the hand-over is already using one.
+	if p.Transitioning() {
+		return ErrTransitioning
+	}
 	return p.update(ctx, lavalink.PlayerUpdate{EndTime: &end})
 }
 
@@ -864,6 +899,15 @@ func (p *Player) preBuffer(ctx context.Context) error {
 		return nil
 	}
 	if p.changingNode() {
+		return nil
+	}
+	// A hand-over is already running, and the node will not take a successor
+	// until it finishes: it holds the one it is promoting. Worse, the crossfade
+	// settings this request carries make the node re-arm its transition, which
+	// throws away the marker the pending hand-over promotes on — so sending
+	// this now is what leaves a skip unable to finish. The TrackEnd that
+	// promotes it schedules another sync.
+	if p.Transitioning() {
 		return nil
 	}
 	p.mu.RLock()

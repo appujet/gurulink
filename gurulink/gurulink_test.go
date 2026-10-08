@@ -823,8 +823,10 @@ func TestPromotionRestartsPosition(t *testing.T) {
 	})
 
 	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "one"}, Reason: lavalink.ReasonCrossfade})
-	if got := player.Position(); got != 0 {
-		t.Errorf("the position is %s after a crossfade handoff, want 0", got)
+	// Back to the start of the successor, and still running: the node keeps the
+	// successor active through a transition end, so audio really is advancing.
+	if got := player.Position(); got > lavalink.Second {
+		t.Errorf("the position is %s after a crossfade handoff, want it near 0", got)
 	}
 
 	player.handle(ctx, &TrackPromotedEvent{Player: player, Track: lavalink.Track{Encoded: "two"}})
@@ -1351,5 +1353,214 @@ func TestCrossfadeUntouchedByStockNode(t *testing.T) {
 	got := player.Crossfade()
 	if got == nil || !got.Enable || got.DurationMs != 1500 {
 		t.Errorf("a stock node's reply clobbered the override: %+v", got)
+	}
+}
+
+// TestCrossfadeSeekSkipSequence is the Reever report, exactly:
+// crossfade on, play, seek, skip, seek, skip twice.
+//
+// A crossfade skip hands over by playhead — the node promotes the successor
+// when the outgoing track reaches the end of the fade window, and the marker it
+// uses lives on that track's timeline. Two things used to destroy it: a Seek,
+// which moves the playhead away from the marker, and the pre-buffer sync, whose
+// crossfade settings make the node re-arm and throw the marker away. Either left
+// the node holding a successor it could never promote, after which it ignores
+// every new transition and only promotes the stuck one — so the next skip did
+// nothing visible and the one after it finally advanced.
+func TestCrossfadeSeekSkipSequence(t *testing.T) {
+	client := testClient(t, func(c *Config) {
+		c.Crossfade = &lavalink.Crossfade{Enable: true, DurationMs: 3000, ManualDurationMs: 3500}
+	})
+	bodies := make(chan []byte, 64)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	seekable := func(encoded string) lavalink.Track {
+		return lavalink.Track{
+			Encoded: encoded,
+			Info:    lavalink.TrackInfo{Length: 4 * lavalink.Minute, IsSeekable: true},
+		}
+	}
+	drain := func() {
+		for {
+			select {
+			case <-bodies:
+			case <-time.After(80 * time.Millisecond):
+				return
+			}
+		}
+	}
+	nextBody := func() string {
+		t.Helper()
+		select {
+		case b := <-bodies:
+			return string(b)
+		case <-time.After(2 * time.Second):
+			t.Fatal("no request reached the node")
+			return ""
+		}
+	}
+
+	ctx := context.Background()
+
+	// 1. Play, with two more queued so a skip has somewhere to go.
+	if err := player.Play(ctx, seekable("one")); err != nil {
+		t.Fatal(err)
+	}
+	player.queue.Add(ctx, seekable("two"), seekable("three"))
+	drain()
+
+	// 2. Seek works.
+	if err := player.Seek(ctx, 30*lavalink.Second); err != nil {
+		t.Fatalf("the first seek failed: %v", err)
+	}
+	if body := nextBody(); !strings.Contains(body, `"position":30000`) {
+		t.Errorf("the first seek sent %s", body)
+	}
+
+	// 3. Skip arms the hand-over and leaves the queue where it is.
+	if err := player.Skip(ctx); err != nil {
+		t.Fatalf("skip: %v", err)
+	}
+	body := nextBody()
+	if !strings.Contains(body, `"transition":true`) || !strings.Contains(body, `"nextTrack":{"encoded":"two"}`) {
+		t.Fatalf("the skip did not arm a transition: %s", body)
+	}
+	if !player.Transitioning() {
+		t.Fatal("the player should report the hand-over in flight")
+	}
+
+	// 4. Seek during the hand-over. It must refuse rather than move the playhead
+	//    the node is promoting on — that is the bug.
+	if err := player.Seek(ctx, 10*lavalink.Second); !errors.Is(err, ErrTransitioning) {
+		t.Errorf("seeking mid-hand-over returned %v, want ErrTransitioning", err)
+	}
+	if err := player.SetEndTime(ctx, 20*lavalink.Second); !errors.Is(err, ErrTransitioning) {
+		t.Errorf("setting an end time mid-hand-over returned %v, want ErrTransitioning", err)
+	}
+	select {
+	case body := <-bodies:
+		t.Fatalf("a request reached the node during the hand-over: %s", body)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// 4b. The debounced pre-buffer must stay silent too: its crossfade settings
+	//     are what made the node re-arm and drop the promotion marker.
+	player.queue.Add(ctx, seekable("four"))
+	select {
+	case body := <-bodies:
+		t.Fatalf("a queue edit pre-buffered during the hand-over: %s", body)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	// 5. The node finishes the hand-over. ONE skip is all it took, so the queue
+	//    advances here and the window closes.
+	player.handle(ctx, &TrackEndEvent{
+		Player: player,
+		Track:  lavalink.Track{Encoded: "one"},
+		Reason: lavalink.ReasonCrossfade,
+	})
+	if player.Transitioning() {
+		t.Error("the hand-over should be over once the node promoted it")
+	}
+	if current := player.queue.Current(); current == nil || current.Encoded != "two" {
+		t.Fatalf("the queue did not advance on the promotion: %v", current)
+	}
+
+	// Seeking works again straight away, against the track now playing.
+	if err := player.Seek(ctx, 45*lavalink.Second); err != nil {
+		t.Fatalf("the seek after the hand-over failed: %v", err)
+	}
+	var seen string
+	for i := 0; i < 8 && !strings.Contains(seen, `"position":45000`); i++ {
+		seen = nextBody()
+	}
+	if !strings.Contains(seen, `"position":45000`) {
+		t.Errorf("the seek after the hand-over sent %s", seen)
+	}
+	drain()
+
+	// And a single skip advances — no need to press it twice.
+	if err := player.Skip(ctx); err != nil {
+		t.Fatalf("the second skip: %v", err)
+	}
+	if body := nextBody(); !strings.Contains(body, `"transition":true`) {
+		t.Fatalf("the second skip did not arm a transition: %s", body)
+	}
+	player.handle(ctx, &TrackEndEvent{
+		Player: player,
+		Track:  lavalink.Track{Encoded: "two"},
+		Reason: lavalink.ReasonCrossfade,
+	})
+	if current := player.queue.Current(); current == nil || current.Encoded != "three" {
+		t.Fatalf("one skip should advance to three, got %v", current)
+	}
+}
+
+// TestTransitioningClearedByNode is the backstop: a hand-over that never
+// produced a promoted TrackEnd must not leave seeking refused forever.
+func TestTransitioningClearedByNode(t *testing.T) {
+	client := testClient(t, func(c *Config) { c.Crossfade = &lavalink.Crossfade{Enable: true} })
+	bodies := make(chan []byte, 32)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "two"})
+
+	if err := player.Skip(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !player.Transitioning() {
+		t.Fatal("setup: expected a hand-over in flight")
+	}
+	// Only a TrackStart arrives, with no promoted TrackEnd before it.
+	player.handle(ctx, &TrackStartEvent{Player: player, Track: lavalink.Track{Encoded: "two"}})
+	if player.Transitioning() {
+		t.Error("a track starting should clear the hand-over flag")
+	}
+}
+
+// TestSeekReplyNotRejectedByPrecision pins a bug a real node found and the fake
+// could not: the wire carries unix millis, so a reply the node generated after a
+// seek truncates to an earlier instant than a nanosecond-precision local stamp.
+// The freshness gate then rejected it and threw away the volume, pause and
+// filters it carried — the player went on reporting the wrong pause state.
+func TestSeekReplyNotRejectedByPrecision(t *testing.T) {
+	client := testClient(t, nil)
+	bodies := make(chan []byte, 8)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+	go func() {
+		for range bodies {
+		}
+	}()
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{
+		Encoded: "one",
+		Info:    lavalink.TrackInfo{Length: 5 * lavalink.Minute, IsSeekable: true},
+	})
+	if err := player.Seek(ctx, 30*lavalink.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	// The local stamp has to be a whole millisecond, or anything the node sends
+	// inside that millisecond looks older than it is.
+	stamp := player.State().Time.Time
+	if stamp.Truncate(time.Millisecond) != stamp {
+		t.Errorf("the local seek stamp %v is finer than the wire's millisecond", stamp)
+	}
+
+	// A reply stamped in the very same millisecond must still apply.
+	same := lavalink.PlayerState{
+		Time:     lavalink.Timestamp{Time: time.UnixMilli(stamp.UnixMilli())},
+		Position: 30 * lavalink.Second,
+		Ping:     42,
+	}
+	player.absorb(lavalink.PlayerInfo{State: same, Volume: 77, Paused: true})
+	if !player.Paused() {
+		t.Error("a reply from the same millisecond as the seek was rejected, losing the pause")
+	}
+	if got := player.Volume(); got != 77 {
+		t.Errorf("volume is %d after that reply, want 77", got)
 	}
 }
