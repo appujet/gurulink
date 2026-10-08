@@ -372,8 +372,17 @@ func (n *Node) handle(ctx context.Context, data []byte) {
 		if !n.decode(data, update) {
 			return
 		}
-		player.setState(update.State)
+
+		if !player.setState(update.State) {
+			n.log.Debug("gurulink: stale player update",
+				slog.String("guild_id", frame.GuildID), slog.Time("stamp", update.State.Time.Time))
+			return
+		}
 		n.client.emit(update)
+		if player.takeFiltersDirty() {
+			position := player.Position()
+			go player.background(func(ctx context.Context) error { return player.Seek(ctx, position) })
+		}
 
 	case lavalink.OpEvent:
 		n.handleEvent(ctx, frame.Type, frame.GuildID, data)
@@ -417,7 +426,7 @@ func (n *Node) afterReady(ctx context.Context, resumed bool) {
 		if player.Node() != n {
 			continue
 		}
-		if err := player.restore(ctx); err != nil {
+		if err := player.cmd(ctx, player.restore); err != nil {
 			n.client.emit(&ErrorEvent{Node: n, Err: fmt.Errorf(
 				"gurulink: restore player %s: %w", player.GuildID(), err)})
 		}

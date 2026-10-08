@@ -33,16 +33,39 @@ type Config struct {
 	// QueueStore persists queues; nil keeps them in memory only.
 	QueueStore queue.Store
 	// OnQueueChange is told about every queue change, for a now-playing message.
+	//
+	// It runs inside the change, which can be inside a player command, so it
+	// must not call a player method that changes the track ([Player.Play],
+	// [Player.Skip], [Player.Stop], [Player.Back], [Player.SkipTo],
+	// [Player.MoveNode]): those serialise against the command already running
+	// and the call would block forever. Read the player, or start a goroutine.
 	OnQueueChange func(ctx context.Context, guildID string, change queue.Change, tracks []lavalink.Track)
 
 	// Autoplay is asked for more tracks when a queue runs dry, before
 	// [QueueEndEvent]. Add them to the player's queue; adding none ends it.
+	//
+	// With crossfade on it is also asked one track early, so the node has
+	// something to fade into. It is never called twice at once, and a call that
+	// adds nothing is not retried for [Config.AutoplayCooldown].
+	//
+	// Add tracks with [queue.Queue.Add] and return. It runs inside the command
+	// that needs the tracks, so calling a player method that changes the track
+	// ([Player.Play], [Player.Skip], ...) would block forever against the
+	// command already running.
 	Autoplay func(ctx context.Context, player *Player) error
+	// AutoplayCooldown is how long to leave [Config.Autoplay] alone after a call
+	// that added no tracks, so a source that is down is not asked once per track.
+	// Defaults to 5s.
+	AutoplayCooldown time.Duration
 	// EmptyQueueTimeout destroys an idle player after this long. Zero never does.
 	EmptyQueueTimeout time.Duration
-	// MaxTrackErrors stops a player after this many failures in a row. Defaults
-	// to 3; negative never stops.
+	// MaxTrackErrors stops a player after this many failures inside
+	// [Config.TrackErrorWindow]. Defaults to 3; negative never stops.
 	MaxTrackErrors int
+	// TrackErrorWindow is how long a track failure counts towards
+	// [Config.MaxTrackErrors]. Older failures are forgotten, so a long-lived
+	// player is not torn down by errors hours apart. Defaults to 10s.
+	TrackErrorWindow time.Duration
 
 	// Resuming keeps players alive this long after a websocket drop. Zero
 	// disables it, so a drop stops the music.
@@ -80,6 +103,12 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxTrackErrors == 0 {
 		c.MaxTrackErrors = 3
+	}
+	if c.TrackErrorWindow <= 0 {
+		c.TrackErrorWindow = 10 * time.Second
+	}
+	if c.AutoplayCooldown <= 0 {
+		c.AutoplayCooldown = 5 * time.Second
 	}
 	if c.MaxReconnects == 0 {
 		c.MaxReconnects = 10

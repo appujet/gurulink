@@ -61,6 +61,15 @@ type Queue struct {
 	current  *lavalink.Track
 	previous []lavalink.Track
 	tracks   []lavalink.Track
+	replayed bool
+}
+
+// Replayed reports whether the playing track came back out of the history, in
+// which case it is already there and must not be retired into it twice.
+func (q *Queue) Replayed() bool {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.replayed
 }
 
 // OnChange returns the queue-change callback, if any.
@@ -281,7 +290,7 @@ func (q *Queue) Advance(ctx context.Context) (lavalink.Track, bool) {
 	q.mu.Lock()
 	retired := q.retire()
 	if len(q.tracks) == 0 {
-		q.current = nil
+		q.current, q.replayed = nil, false
 		q.mu.Unlock()
 		if retired {
 			q.changed(ctx, Removed, nil)
@@ -290,7 +299,7 @@ func (q *Queue) Advance(ctx context.Context) (lavalink.Track, bool) {
 	}
 	next := q.tracks[0]
 	q.tracks = slices.Delete(q.tracks, 0, 1)
-	q.current = &next
+	q.current, q.replayed = &next, false
 	q.mu.Unlock()
 	q.changed(ctx, Removed, []lavalink.Track{next})
 	return next, true
@@ -308,7 +317,8 @@ func (q *Queue) Back(ctx context.Context) (lavalink.Track, bool) {
 	if q.current != nil {
 		q.tracks = slices.Insert(q.tracks, 0, *q.current)
 	}
-	q.current = &prev
+
+	q.current, q.replayed = &prev, true
 	q.mu.Unlock()
 	q.changed(ctx, Added, nil)
 	return prev, true
@@ -330,14 +340,14 @@ func (q *Queue) SetCurrent(ctx context.Context, t *lavalink.Track) {
 		track := *t
 		t = &track
 	}
-	q.current = t
+	q.current, q.replayed = t, false
 	q.mu.Unlock()
 	q.changed(ctx, Current, nil)
 }
 
 // retire moves the playing track into the history. Caller holds the lock.
 func (q *Queue) retire() bool {
-	if q.current == nil {
+	if q.current == nil || q.replayed {
 		return false
 	}
 	q.previous = slices.Insert(q.previous, 0, *q.current)

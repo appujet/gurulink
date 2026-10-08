@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -319,7 +320,10 @@ func TestSkipCrossfade(t *testing.T) {
 		t.Errorf("the promotion duplicated the queue: %d tracks", n)
 	}
 
-	// Crossfade off: the same skip has to replace the track itself.
+	// Crossfade off: the same skip stops the track instead of fading, and the
+	// queue waits for the TrackEnd that stop produces. Advancing here as well
+	// would give the queue two writers, which is what ate a track when a skip
+	// landed on a track that was ending anyway.
 	if err := player.SetCrossfade(ctx, &lavalink.Crossfade{}); err != nil {
 		t.Fatal(err)
 	}
@@ -336,8 +340,24 @@ func TestSkipCrossfade(t *testing.T) {
 	if err := player.Skip(ctx); err != nil {
 		t.Fatal(err)
 	}
+	body = string(<-bodies)
+	if !strings.Contains(body, `"track":{"encoded":null}`) {
+		t.Errorf("the skip request %s does not stop the track", body)
+	}
+	if !strings.Contains(body, `"paused":false`) {
+		t.Errorf("the skip request %s does not unpause, so a paused player would stay silent", body)
+	}
+	if current := player.queue.Current(); current == nil || current.Encoded != "next" {
+		t.Errorf("the skip advanced the queue itself instead of waiting for the end: %v", current)
+	}
+	// The stop the skip asked for comes back as TrackEnd (stopped): that is where
+	// the queue moves, and the skipped flag is what tells it this was deliberate.
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "next"}, Reason: lavalink.ReasonStopped})
 	if body := string(<-bodies); !strings.Contains(body, `"track":{"encoded":"after"}`) {
-		t.Errorf("the skip request %s does not play the next track", body)
+		t.Errorf("the end of a skipped track %s does not play the next one", body)
+	}
+	if current := player.queue.Current(); current == nil || current.Encoded != "after" {
+		t.Errorf("the queue did not advance on the skipped track's end: %v", current)
 	}
 }
 
@@ -475,5 +495,585 @@ func TestNodeCloseDeadline(t *testing.T) {
 				t.Errorf("the node closed with code %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSkipWaitsForEnd is the single-writer rule: a skip stops the track and the
+// queue moves on the TrackEnd that stop produces, never in the command. A skip
+// that advanced locally would race the end of the track it is skipping and the
+// two together would consume two tracks for one press.
+func TestSkipWaitsForEnd(t *testing.T) {
+	client := testClient(t, nil)
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "two"}, lavalink.Track{Encoded: "three"})
+
+	if err := player.Skip(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if body := string(<-bodies); !strings.Contains(body, `"track":{"encoded":null}`) {
+		t.Errorf("the skip request %s does not stop the track", body)
+	}
+	if current := player.queue.Current(); current == nil || current.Encoded != "one" {
+		t.Fatalf("the skip advanced the queue instead of waiting for the end: %v", current)
+	}
+
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "one"}, Reason: lavalink.ReasonStopped})
+	if body := string(<-bodies); !strings.Contains(body, `"track":{"encoded":"two"}`) {
+		t.Errorf("the skipped track's end %s does not play the next one", body)
+	}
+	if current := player.queue.Current(); current == nil || current.Encoded != "two" {
+		t.Fatalf("the queue did not advance on the skipped track's end: %v", current)
+	}
+
+	// The natural end of the track that was skipped arrives late. It names a
+	// track that is no longer current, so it must do nothing: advancing here is
+	// what used to eat "three".
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "one"}, Reason: lavalink.ReasonFinished})
+	select {
+	case body := <-bodies:
+		t.Errorf("a stale end sent a request: %s", body)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if current := player.queue.Current(); current == nil || current.Encoded != "two" {
+		t.Errorf("a stale end moved the queue: %v", current)
+	}
+	if got := player.queue.Tracks(); len(got) != 1 || got[0].Encoded != "three" {
+		t.Errorf("a stale end consumed a queued track: %v", got)
+	}
+}
+
+// TestStopDoesNotAdvance pins the other half of the stopped reason: a stop and a
+// skip look identical on the wire, so the flag the command leaves behind is the
+// only thing that tells them apart.
+func TestStopDoesNotAdvance(t *testing.T) {
+	var ended int
+	client := testClient(t, func(c *Config) {
+		c.Listeners = []Listener{On(func(e *QueueEndEvent) { ended++ })}
+	})
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "two"})
+
+	if err := player.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-bodies // Stop's own null-track request.
+
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "one"}, Reason: lavalink.ReasonStopped})
+	if body := string(<-bodies); !strings.Contains(body, `"track":{"encoded":null}`) {
+		t.Errorf("a stopped player played something: %s", body)
+	}
+	if current := player.queue.Current(); current != nil {
+		t.Errorf("a stopped player still has a current track: %v", current)
+	}
+	if ended != 1 {
+		t.Errorf("the queue end fired %d times, want 1", ended)
+	}
+}
+
+// TestBareStopIgnored covers a stop nobody asked for: with no flag set the queue
+// must stay put rather than treat it as a skip.
+func TestBareStopIgnored(t *testing.T) {
+	client := testClient(t, nil)
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "two"})
+
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "one"}, Reason: lavalink.ReasonStopped})
+	select {
+	case body := <-bodies:
+		t.Errorf("an unasked-for stop sent a request: %s", body)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if current := player.queue.Current(); current == nil || current.Encoded != "one" {
+		t.Errorf("an unasked-for stop moved the queue: %v", current)
+	}
+}
+
+// TestSkipKeepsRepeatQueue covers the re-add living in the one advance primitive
+// rather than in a single caller: a skipped track has to stay in the rotation,
+// exactly like one that finished.
+func TestSkipKeepsRepeatQueue(t *testing.T) {
+	client := testClient(t, nil)
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+	player.SetRepeat(RepeatQueue)
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "two"})
+
+	if err := player.Skip(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-bodies
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "one"}, Reason: lavalink.ReasonStopped})
+	<-bodies
+
+	if current := player.queue.Current(); current == nil || current.Encoded != "two" {
+		t.Fatalf("the skip did not advance: %v", current)
+	}
+	if got := player.queue.Tracks(); len(got) != 1 || got[0].Encoded != "one" {
+		t.Errorf("the skipped track fell out of the repeat-queue rotation: %v", got)
+	}
+}
+
+// TestSkipLeavesRepeatTrack covers the skip flag beating the loop, the
+// non-crossfade twin of TestTransitionEndRepeatTrack.
+func TestSkipLeavesRepeatTrack(t *testing.T) {
+	client := testClient(t, nil)
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+	player.SetRepeat(RepeatTrack)
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "loop"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "other"})
+
+	// A natural end loops.
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "loop"}, Reason: lavalink.ReasonFinished})
+	<-bodies
+	if current := player.queue.Current(); current == nil || current.Encoded != "loop" {
+		t.Fatalf("a natural end broke the loop: %v", current)
+	}
+
+	// An explicit skip leaves it.
+	if err := player.Skip(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-bodies
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "loop"}, Reason: lavalink.ReasonStopped})
+	<-bodies
+	if current := player.queue.Current(); current == nil || current.Encoded != "other" {
+		t.Errorf("an explicit skip did not leave the loop: %v", current)
+	}
+}
+
+// TestStaleStateIgnored is the seek bug: the websocket and REST carry no
+// ordering between them, so a playerUpdate the node stamped before a seek can be
+// read after the seek's reply. Taking it would roll the position back and the
+// seek would look ignored even though the audio moved.
+func TestStaleStateIgnored(t *testing.T) {
+	client := testClient(t, nil)
+	player := newPlayer(client, &Node{cfg: NodeConfig{Name: "test"}, client: client, log: client.Logger()}, "g")
+
+	now := time.Now()
+	fresh := lavalink.PlayerState{
+		Time:     lavalink.Timestamp{Time: now},
+		Position: 60 * lavalink.Second,
+	}
+	if !player.setState(fresh) {
+		t.Fatal("the first frame should apply")
+	}
+
+	stale := lavalink.PlayerState{
+		Time:     lavalink.Timestamp{Time: now.Add(-2 * time.Second)},
+		Position: 5 * lavalink.Second,
+	}
+	if player.setState(stale) {
+		t.Error("a frame the node stamped earlier should not apply")
+	}
+	if got := player.State().Position; got != 60*lavalink.Second {
+		t.Errorf("a stale frame moved the position to %s, want 1m0s", got)
+	}
+
+	// A later frame still gets through, so the gate does not freeze the clock.
+	newer := lavalink.PlayerState{
+		Time:     lavalink.Timestamp{Time: now.Add(2 * time.Second)},
+		Position: 62 * lavalink.Second,
+	}
+	if !player.setState(newer) {
+		t.Error("a newer frame should apply")
+	}
+	if got := player.State().Position; got != 62*lavalink.Second {
+		t.Errorf("the position is %s after a newer frame, want 1m2s", got)
+	}
+
+	// A node that sends no timestamp gets the benefit of the doubt rather than
+	// having every frame rejected.
+	if !player.setState(lavalink.PlayerState{Position: 7 * lavalink.Second}) {
+		t.Error("an unstamped frame should apply")
+	}
+}
+
+// TestSeekMovesPositionBeforeReply covers lavalink-client writing lastPosition
+// before its request: without it Position() keeps interpolating the old timeline
+// for a whole round trip.
+func TestSeekMovesPositionBeforeReply(t *testing.T) {
+	client := testClient(t, nil)
+	bodies := make(chan []byte, 8)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{
+		Encoded: "one",
+		Info:    lavalink.TrackInfo{Length: 5 * lavalink.Minute, IsSeekable: true},
+	})
+
+	if err := player.Seek(ctx, 90*lavalink.Second); err != nil {
+		t.Fatal(err)
+	}
+	if body := string(<-bodies); !strings.Contains(body, `"position":90000`) {
+		t.Errorf("the seek request %s does not carry the position", body)
+	}
+	if got := player.State().Position; got != 90*lavalink.Second {
+		t.Errorf("the local position is %s after a seek, want 1m30s", got)
+	}
+
+	// And a frame from before the seek cannot undo it.
+	player.setState(lavalink.PlayerState{
+		Time:     lavalink.Timestamp{Time: time.Now().Add(-time.Second)},
+		Position: 3 * lavalink.Second,
+	})
+	if got := player.Position(); got < 90*lavalink.Second {
+		t.Errorf("a frame from before the seek rolled the position back to %s", got)
+	}
+}
+
+// TestSeekGuards covers the three checks lavalink-client makes before it sends
+// anything, so an impossible seek never becomes a REST error.
+func TestSeekGuards(t *testing.T) {
+	client := testClient(t, nil)
+	bodies := make(chan []byte, 8)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+	ctx := context.Background()
+
+	// Nothing playing: a no-op, not a request.
+	if err := player.Seek(ctx, lavalink.Second); err != nil {
+		t.Errorf("seeking with nothing playing: %v", err)
+	}
+	select {
+	case body := <-bodies:
+		t.Errorf("seeking with nothing playing sent %s", body)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	player.queue.SetCurrent(ctx, &lavalink.Track{
+		Encoded: "live",
+		Info:    lavalink.TrackInfo{IsStream: true},
+	})
+	if err := player.Seek(ctx, lavalink.Second); !errors.Is(err, ErrNotSeekable) {
+		t.Errorf("seeking a stream: %v, want ErrNotSeekable", err)
+	}
+
+	player.queue.SetCurrent(ctx, &lavalink.Track{
+		Encoded: "fixed",
+		Info:    lavalink.TrackInfo{Length: 10 * lavalink.Second, IsSeekable: false},
+	})
+	if err := player.Seek(ctx, lavalink.Second); !errors.Is(err, ErrNotSeekable) {
+		t.Errorf("seeking an unseekable track: %v, want ErrNotSeekable", err)
+	}
+
+	// Past the end clamps to the end; below zero clamps to zero.
+	player.queue.SetCurrent(ctx, &lavalink.Track{
+		Encoded: "ok",
+		Info:    lavalink.TrackInfo{Length: 10 * lavalink.Second, IsSeekable: true},
+	})
+	if err := player.Seek(ctx, lavalink.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if body := string(<-bodies); !strings.Contains(body, `"position":10000`) {
+		t.Errorf("a seek past the end sent %s, want it clamped to the length", body)
+	}
+	if err := player.Seek(ctx, -lavalink.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if body := string(<-bodies); !strings.Contains(body, `"position":0`) {
+		t.Errorf("a negative seek sent %s, want it clamped to zero", body)
+	}
+}
+
+// TestPromotionRestartsPosition covers the timeline following the audio across a
+// crossfade: without it Position() reports the outgoing track's elapsed time
+// against the incoming one and a Now Playing progress bar is simply wrong.
+func TestPromotionRestartsPosition(t *testing.T) {
+	client := testClient(t, func(c *Config) { c.Crossfade = &lavalink.Crossfade{Enable: true} })
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "two"})
+	player.setState(lavalink.PlayerState{
+		Time:     lavalink.Timestamp{Time: time.Now()},
+		Position: 3 * lavalink.Minute,
+	})
+
+	player.handle(ctx, &TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "one"}, Reason: lavalink.ReasonCrossfade})
+	if got := player.Position(); got != 0 {
+		t.Errorf("the position is %s after a crossfade handoff, want 0", got)
+	}
+
+	player.handle(ctx, &TrackPromotedEvent{Player: player, Track: lavalink.Track{Encoded: "two"}})
+	if got := player.Position(); got > lavalink.Second {
+		t.Errorf("the position is %s after a promotion, want it near 0", got)
+	}
+}
+
+// TestPromotionKeepsDoubleQueued covers the de-duplication only firing when the
+// node is playing something unexpected: the same track queued twice is a normal
+// thing to do, and the second copy must survive the first one's promotion.
+func TestPromotionKeepsDoubleQueued(t *testing.T) {
+	client := testClient(t, func(c *Config) { c.Crossfade = &lavalink.Crossfade{Enable: true} })
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "same"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "same"}, lavalink.Track{Encoded: "other"})
+
+	player.handle(ctx, &TrackPromotedEvent{Player: player, Track: lavalink.Track{Encoded: "same"}})
+	if got := player.queue.Tracks(); len(got) != 2 || got[0].Encoded != "same" {
+		t.Errorf("the promotion ate the queued copy of the playing track: %v", got)
+	}
+}
+
+// TestTrackStartAdoptsNodeTrack is a deliberate step past lavalink-client, which
+// only fills Current when it is empty. A Go player is driven from several
+// goroutines, so the node's word has to be able to correct a divergence —
+// otherwise the status names one track while another is audible, forever.
+func TestTrackStartAdoptsNodeTrack(t *testing.T) {
+	client := testClient(t, nil)
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "stale"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "real"}, lavalink.Track{Encoded: "later"})
+
+	player.handle(ctx, &TrackStartEvent{Player: player, Track: lavalink.Track{Encoded: "real"}})
+	if current := player.queue.Current(); current == nil || current.Encoded != "real" {
+		t.Fatalf("the node's word did not correct the current track: %v", current)
+	}
+	for _, got := range player.queue.Tracks() {
+		if got.Encoded == "real" {
+			t.Errorf("the started track was left queued to replay: %v", player.queue.Tracks())
+		}
+	}
+}
+
+// TestNodeChangingSilencesTrackEvents covers the gate around a node move: the
+// old node's events describe a player that is about to be destroyed, and letting
+// one advance the queue drives it against the new node mid-rebuild.
+func TestNodeChangingSilencesTrackEvents(t *testing.T) {
+	client := testClient(t, nil)
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "two"})
+
+	player.mu.Lock()
+	player.nodeChanging = true
+	player.mu.Unlock()
+
+	for _, event := range []Event{
+		&TrackEndEvent{Player: player, Track: lavalink.Track{Encoded: "one"}, Reason: lavalink.ReasonFinished},
+		&TrackStartEvent{Player: player, Track: lavalink.Track{Encoded: "elsewhere"}},
+		&TrackPromotedEvent{Player: player, Track: lavalink.Track{Encoded: "elsewhere"}},
+		&TrackStuckEvent{Player: player, Track: lavalink.Track{Encoded: "one"}},
+	} {
+		player.handle(ctx, event)
+	}
+	select {
+	case body := <-bodies:
+		t.Errorf("an event during a node move sent a request: %s", body)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if current := player.queue.Current(); current == nil || current.Encoded != "one" {
+		t.Errorf("an event during a node move moved the queue: %v", current)
+	}
+	if n := player.queue.Len(); n != 1 {
+		t.Errorf("an event during a node move consumed the queue: %d tracks", n)
+	}
+}
+
+// TestTrackErrorWindow covers failures expiring: a long-lived player that hits
+// scattered errors over hours must not be torn down as if it had a burst.
+func TestTrackErrorWindow(t *testing.T) {
+	client := testClient(t, func(c *Config) {
+		c.MaxTrackErrors = 3
+		c.TrackErrorWindow = 50 * time.Millisecond
+	})
+	player := newPlayer(client, &Node{cfg: NodeConfig{Name: "test"}, client: client, log: client.Logger()}, "g")
+
+	if player.trackFailed() || player.trackFailed() {
+		t.Fatal("two failures should be under the limit")
+	}
+	// Let them age out, then two more must still be under the limit.
+	time.Sleep(80 * time.Millisecond)
+	if player.trackFailed() || player.trackFailed() {
+		t.Fatal("failures outside the window should be forgotten")
+	}
+	// A third inside the window trips it.
+	if !player.trackFailed() {
+		t.Error("three failures inside the window should give up")
+	}
+}
+
+// TestTrackStartClearsErrorWindow covers a clean start wiping the count, so a
+// recovered player is not destroyed by old failures.
+func TestTrackStartClearsErrorWindow(t *testing.T) {
+	client := testClient(t, func(c *Config) { c.MaxTrackErrors = 2 })
+	bodies := make(chan []byte, 16)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+
+	if player.trackFailed() {
+		t.Fatal("one failure should be under the limit")
+	}
+	player.handle(context.Background(), &TrackStartEvent{Player: player, Track: lavalink.Track{Encoded: "one"}})
+	if player.trackFailed() {
+		t.Error("a clean start should have cleared the failure count")
+	}
+}
+
+// TestConcurrentSkipAndEnd is the race the command lock and the staleness guard
+// exist for: a user skip landing at the same moment the track ends. Both used to
+// advance the queue, so one press consumed two tracks — the extra one went
+// straight to the history without ever being audible. The invariant is one
+// advance per end, however the two interleave. Run under -race.
+func TestConcurrentSkipAndEnd(t *testing.T) {
+	const queued, rounds = 40, 20
+
+	client := testClient(t, nil)
+	bodies := make(chan []byte, 512)
+	player := newPlayer(client, testNode(t, client, bodies), "g")
+	go func() {
+		for range bodies {
+		}
+	}()
+
+	ctx := context.Background()
+	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "t0"})
+	for i := 1; i <= queued; i++ {
+		player.queue.Add(ctx, lavalink.Track{Encoded: fmt.Sprintf("t%d", i)})
+	}
+
+	for round := 0; round < rounds; round++ {
+		before := player.queue.Current()
+		if before == nil {
+			t.Fatalf("round %d: the player lost its current track", round)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = player.Skip(ctx)
+		}()
+		go func() {
+			defer wg.Done()
+			player.handle(ctx, &TrackEndEvent{Player: player, Track: *before, Reason: lavalink.ReasonFinished})
+		}()
+		wg.Wait()
+
+		// The advance runs off the event loop, so wait for it to land rather
+		// than guessing. Anything still pending after this would show up as a
+		// miscount below.
+		for waited := 0; waited < 200; waited++ {
+			if current := player.queue.Current(); current == nil || current.Encoded != before.Encoded {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// One track consumed per end. Two writers would have eaten them in pairs and
+	// run the queue dry around round 20.
+	if got := player.queue.Len(); got != queued-rounds {
+		t.Errorf("%d tracks left after %d skips, want %d: the queue advanced more than once per end",
+			got, rounds, queued-rounds)
+	}
+	if got := len(player.queue.Previous()); got != rounds {
+		t.Errorf("%d tracks in the history after %d skips, want %d", got, rounds, rounds)
+	}
+	current := player.queue.Current()
+	if current == nil {
+		t.Fatal("the player lost its current track entirely")
+	}
+	if want := fmt.Sprintf("t%d", rounds); current.Encoded != want {
+		t.Errorf("playing %s after %d skips, want %s", current.Encoded, rounds, want)
+	}
+	// Nothing may be both playing and still waiting.
+	seen := map[string]bool{current.Encoded: true}
+	for _, track := range player.queue.Tracks() {
+		if seen[track.Encoded] {
+			t.Fatalf("%s is both playing and queued after the race", track.Encoded)
+		}
+		seen[track.Encoded] = true
+	}
+}
+
+// TestAutoplayCooldown covers the retry guard: a source that is down used to be
+// asked again on every single track end. lavalink-client holds it off with
+// internal_autoplay_failed_at for the same reason.
+func TestAutoplayCooldown(t *testing.T) {
+	var calls int
+	var addTracks bool
+	client := testClient(t, func(c *Config) {
+		c.AutoplayCooldown = 60 * time.Millisecond
+		c.Autoplay = func(ctx context.Context, p *Player) error {
+			calls++
+			if addTracks {
+				p.Queue().Add(ctx, lavalink.Track{Encoded: "found"})
+			}
+			return nil
+		}
+	})
+	player := newPlayer(client, &Node{cfg: NodeConfig{Name: "test"}, client: client, log: client.Logger()}, "g")
+	ctx := context.Background()
+
+	if player.autoplay(ctx) {
+		t.Error("an autoplay that added nothing should report false")
+	}
+	if calls != 1 {
+		t.Fatalf("autoplay ran %d times, want 1", calls)
+	}
+	// Straight away again: held off, so a dead source is not hammered.
+	if player.autoplay(ctx) || calls != 1 {
+		t.Errorf("autoplay ran %d times inside the cooldown, want 1", calls)
+	}
+
+	time.Sleep(80 * time.Millisecond)
+	addTracks = true
+	if !player.autoplay(ctx) {
+		t.Error("an autoplay that added a track should report true")
+	}
+	if calls != 2 {
+		t.Fatalf("autoplay ran %d times after the cooldown, want 2", calls)
+	}
+	// A successful call clears the hold-off, so the next one is free to run.
+	if !player.autoplay(ctx) || calls != 3 {
+		t.Errorf("autoplay ran %d times after a success, want 3", calls)
+	}
+}
+
+// TestAutoplayNotReentered covers the in-progress guard: without it a callback
+// that itself triggers a queue change can be re-entered.
+func TestAutoplayNotReentered(t *testing.T) {
+	var calls int
+	client := testClient(t, nil)
+	player := newPlayer(client, &Node{cfg: NodeConfig{Name: "test"}, client: client, log: client.Logger()}, "g")
+	client.cfg.Autoplay = func(ctx context.Context, p *Player) error {
+		calls++
+		if calls < 3 {
+			p.autoplay(ctx) // re-entry must be refused
+		}
+		return nil
+	}
+
+	player.autoplay(context.Background())
+	if calls != 1 {
+		t.Errorf("autoplay was re-entered: ran %d times, want 1", calls)
 	}
 }

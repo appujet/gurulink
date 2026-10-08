@@ -52,20 +52,32 @@ func (p *Player) stopIdle() {
 // handle reacts to a node event after the listeners saw it, on the read loop:
 // anything talking back to the node gets its own goroutine and timeout.
 func (p *Player) handle(ctx context.Context, event Event) {
+	// A player being rebuilt on another node must not be driven by the old
+	// node's events: they describe a player that is about to be destroyed, and
+	// letting one advance the queue would drive it against the new node
+	// mid-rebuild. lavalink-client gates the same handlers on
+	// internal_nodeChanging.
+	if p.changingNode() {
+		switch event.(type) {
+		case *TrackStartEvent, *TrackPromotedEvent, *TrackEndEvent, *TrackStuckEvent:
+			return
+		}
+	}
+
 	switch e := event.(type) {
 	case *TrackStartEvent:
-		p.mu.Lock()
-		p.errors = 0
-		p.mu.Unlock()
+		p.setStarted(true)
+		p.clearErrors()
 		p.stopIdle()
-		// [Player.PlayIdentifier] and a resumed session leave us without one.
-		if p.queue.Current() == nil {
-			p.queue.SetCurrent(ctx, &e.Track)
-		}
-		p.schedulePreBuffer()
+		p.adopt(ctx, e.Track)
 
 	case *TrackPromotedEvent:
-		p.promoted(ctx, e.Track)
+		p.setStarted(true)
+		// The successor starts from the top. Without this Position() reports the
+		// outgoing track's elapsed time against it, so a Now Playing progress
+		// bar is wrong until the next playerUpdate.
+		p.restart(true)
+		p.adopt(ctx, e.Track)
 
 	case *TrackEndEvent:
 		p.ended(ctx, e)
@@ -77,7 +89,7 @@ func (p *Player) handle(ctx context.Context, event Event) {
 	case *TrackStuckEvent:
 		// A stuck track gets no TrackEnd, so it needs skipping from here.
 		if !p.trackFailed() {
-			go p.background(func(ctx context.Context) error { return p.next(ctx, lavalink.ReasonLoadFailed) })
+			p.goCmd(func(ctx context.Context) error { return p.next(ctx, lavalink.ReasonLoadFailed) })
 		}
 
 	case *WebSocketClosedEvent:
@@ -85,7 +97,9 @@ func (p *Player) handle(ctx context.Context, event Event) {
 	}
 }
 
-// ended decides what follows a finished track.
+// ended decides what follows a finished track. Outside a crossfade handoff this
+// is the only place the queue moves on, which is what stops a user skip and a
+// natural end from each advancing it.
 func (p *Player) ended(ctx context.Context, e *TrackEndEvent) {
 	// A pre-buffered successor already took over on the node, so the queue
 	// advances here — not on TrackPromotedEvent, which is state-sync only.
@@ -96,19 +110,41 @@ func (p *Player) ended(ctx context.Context, e *TrackEndEvent) {
 		p.endedTransition(ctx, e)
 		return
 	}
-	// Stopped and replaced mean somebody else is driving (a skip via next(),
-	// a fresh play, or a stop): the queue already moved.
-	if !e.Reason.StartNext() {
+
+	if e.Reason == lavalink.ReasonReplaced {
 		return
 	}
-	switch p.Repeat() {
-	case RepeatTrack:
-		go p.background(func(ctx context.Context) error { return p.play(ctx, e.Track) })
+
+	// Stale: a racing command already moved past this track, so advancing again
+	// would consume the one now playing. lavalink-client cannot reach this (one
+	// JS event loop), so this guard is the Go equivalent of its serialisation.
+	if current := p.queue.Current(); current != nil && current.Encoded != e.Track.Encoded {
 		return
-	case RepeatQueue:
-		p.queue.Add(ctx, e.Track)
 	}
-	go p.background(func(ctx context.Context) error { return p.next(ctx, e.Reason) })
+
+	// Read the intent only once this end is the one a command was waiting for.
+	// Taking it above the two guards would let a replaced or stale end eat a
+	// pending skip, and that skip would then never advance anything.
+	skipped, stopped := p.takeIntent()
+
+	// A Stop asked for silence, not the next track.
+	if stopped {
+		p.setStarted(false)
+		p.goCmd(func(ctx context.Context) error { return p.next(ctx, e.Reason) })
+		return
+	}
+
+	if !skipped && !e.Reason.StartNext() {
+		return
+	}
+
+	// An explicit skip leaves a RepeatTrack loop, which is lavalink-client's
+	// `repeatMode !== "track" || internal_skipped`.
+	if !skipped && p.Repeat() == RepeatTrack {
+		p.goCmd(func(ctx context.Context) error { return p.play(ctx, e.Track, false) })
+		return
+	}
+	p.goCmd(func(ctx context.Context) error { return p.next(ctx, e.Reason) })
 }
 
 // endedTransition advances the queue after a crossfade/gapless handoff. The
@@ -117,6 +153,12 @@ func (p *Player) ended(ctx context.Context, e *TrackEndEvent) {
 // following one.
 func (p *Player) endedTransition(ctx context.Context, e *TrackEndEvent) {
 	manual := p.takeManualSkip()
+
+	// The successor is already audible from its own start, so the timeline
+	// restarts here. Frozen rather than ticking: lavalink-client nulls
+	// lastPositionChange in this branch and lets the next playerUpdate start the
+	// clock.
+	p.restart(false)
 	// Already moved on (a duplicate end, or a queue that changed under us):
 	// the ended track is no longer current, so there is nothing to retire.
 	if current := p.queue.Current(); current == nil || current.Encoded != e.Track.Encoded {
@@ -129,61 +171,77 @@ func (p *Player) endedTransition(ctx context.Context, e *TrackEndEvent) {
 		p.schedulePreBuffer()
 		return
 	}
-	if !manual && p.Repeat() == RepeatQueue {
-		p.queue.Add(ctx, e.Track)
-	}
-	if _, ok := p.queue.Advance(ctx); !ok {
-		// Nothing was waiting (repeat off, or repeat-track with a dry queue
-		// that PreBuffer cleared): the successor the node holds is all there
-		// is, so take the node's word rather than clearing to nil and
-		// replaying the head later.
-		// ponytail: without a promoted payload here we keep the outgoing
-		// current; the following TrackPromotedEvent will correct it.
-		p.log.Debug("gurulink: transition with nothing queued")
-	}
+
+	// advance() does the repeat-queue re-add, so a skipped track stays in the
+	// rotation exactly like one that finished. lavalink-client drops the re-add
+	// on a manual skip here but keeps it on the non-transition path; treating
+	// both the same is what RepeatQueue is documented to mean.
+	//
+	// Nothing waiting leaves Current nil, and the TrackPromotedEvent that
+	// follows names what the node actually took over with.
+	p.advance(ctx)
 	p.schedulePreBuffer()
 }
 
-// promoted is state-sync only — the preceding trackEnd (crossfade/gapless)
-// already advanced the queue, and the node is already playing the successor,
-// so no play request must be sent. This mirrors lavalink-client's
-// trackPromoted, which never touches the queue head.
-func (p *Player) promoted(ctx context.Context, track lavalink.Track) {
-	// Resumed sessions and PlayIdentifier leave us without one.
-	if p.queue.Current() == nil {
-		p.queue.SetCurrent(ctx, &track)
-		p.schedulePreBuffer()
-		return
+// adopt takes the node's word for what is playing. Both of the node's
+// "now playing" signals land here: TrackStart and TrackPromoted.
+//
+// Deliberately stronger than lavalink-client, which only fills Current when it
+// is empty. That is safe in JS because nothing can drift; a Go player is driven
+// from several goroutines, so without adopting here a divergence would never
+// heal and the status would name one track while another is audible. It runs on
+// the read loop, so it converges rather than taking the command lock.
+func (p *Player) adopt(ctx context.Context, track lavalink.Track) {
+	current := p.queue.Current()
+	// Only when the node is playing something unexpected: the queue moved under
+	// the pre-buffer (an AddNext, a removal, a shuffle between PreBuffer and
+	// promotion), so drop that copy from the waiting list rather than leaving it
+	// to replay. Matching encodings mean the queue is already in step, and a
+	// track legitimately queued twice has to survive.
+	if current == nil || current.Encoded != track.Encoded {
+		if at := p.queue.Find(func(t lavalink.Track) bool { return t.Encoded == track.Encoded }); at >= 0 {
+			p.queue.Remove(ctx, at)
+		}
 	}
-	// Already advanced by the preceding trackEnd: nothing to do.
-	if current := p.queue.Current(); current != nil && current.Encoded == track.Encoded {
-		p.schedulePreBuffer()
-		return
-	}
-	// The queue moved under the pre-buffer (an AddNext, a removal, a shuffle
-	// between PreBuffer and promotion): the node is playing `track`, so drop
-	// that copy from the waiting list instead of leaving it to replay, then
-	// take the node's word for what is current.
-	if at := p.queue.Find(func(t lavalink.Track) bool { return t.Encoded == track.Encoded }); at >= 0 {
-		p.queue.Remove(ctx, at)
-	}
+	// SetCurrent de-duplicates, and refreshes UserData when the same track was
+	// queued by somebody else.
 	p.queue.SetCurrent(ctx, &track)
 	p.schedulePreBuffer()
+}
+
+// clearErrors forgets the failure window after a track started cleanly.
+func (p *Player) clearErrors() {
+	p.mu.Lock()
+	p.errorAt = nil
+	p.mu.Unlock()
 }
 
 // trackFailed counts one failed track and reports whether the player gave up.
 func (p *Player) trackFailed() bool {
 	limit := p.client.cfg.MaxTrackErrors
-	p.mu.Lock()
-	p.errors++
-	count := p.errors
-	p.mu.Unlock()
-
-	if limit < 0 || count < limit {
+	if limit < 0 {
 		return false
 	}
-	p.log.Warn("gurulink: giving up after failed tracks", slog.Int("errors", count))
-	go p.background(func(ctx context.Context) error { return p.Destroy(ctx, DestroyTrackErrors) })
+	window := p.client.cfg.TrackErrorWindow
+	now := time.Now()
+
+	p.mu.Lock()
+	kept := p.errorAt[:0]
+	for _, at := range p.errorAt {
+		if now.Sub(at) < window {
+			kept = append(kept, at)
+		}
+	}
+	p.errorAt = append(kept, now)
+	count := len(p.errorAt)
+	p.mu.Unlock()
+
+	if count < limit {
+		return false
+	}
+	p.log.Warn("gurulink: giving up after failed tracks",
+		slog.Int("errors", count), slog.Duration("within", window))
+	p.goCmd(func(ctx context.Context) error { return p.Destroy(ctx, DestroyTrackErrors) })
 	return true
 }
 

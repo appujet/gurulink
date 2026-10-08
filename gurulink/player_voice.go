@@ -143,6 +143,11 @@ func (p *Player) MoveNode(ctx context.Context, node *Node) error {
 	if node == nil {
 		return errors.New("gurulink: nil node")
 	}
+	return p.cmd(ctx, func(ctx context.Context) error { return p.moveNode(ctx, node) })
+}
+
+// moveNode is [Player.MoveNode] with cmdMu already held.
+func (p *Player) moveNode(ctx context.Context, node *Node) error {
 	p.mu.Lock()
 	if p.destroyed {
 		p.mu.Unlock()
@@ -153,8 +158,19 @@ func (p *Player) MoveNode(ctx context.Context, node *Node) error {
 		p.mu.Unlock()
 		return nil
 	}
+	if p.nodeChanging {
+		p.mu.Unlock()
+		return errors.New("gurulink: player is already changing node")
+	}
+	p.nodeChanging = true
 	p.node = node
 	p.mu.Unlock()
+
+	defer func() {
+		p.mu.Lock()
+		p.nodeChanging = false
+		p.mu.Unlock()
+	}()
 
 	// Best effort: the usual reason to move is that the old node is gone.
 	if err := from.DestroyPlayer(ctx, p.guildID); err != nil && !errors.Is(err, ErrNoSession) {
@@ -187,5 +203,9 @@ func (p *Player) restore(ctx context.Context) error {
 		update.Track = &lavalink.UpdateTrack{Encoded: lavalink.Value(current.Encoded), UserData: current.UserData}
 		update.Position = &position
 	}
+	if crossfade := p.Crossfade(); crossfade != nil && crossfade.Enable {
+		update.Crossfade = lavalink.Value(*crossfade)
+	}
+	p.resetStateClock()
 	return p.update(ctx, update)
 }

@@ -57,38 +57,40 @@ const (
 // Lock order: never take p.mu while holding the queue's lock; node calls happen
 // outside p.mu.
 type Player struct {
-	client  *Client
-	guildID string
-	queue   *queue.Queue
-	log     *slog.Logger
-
-	mu         sync.RWMutex
-	node       *Node
-	channelID  string
-	selfMute   bool
-	selfDeaf   bool
-	serverMute bool
-	serverDeaf bool
-	suppress   bool
-	voice      lavalink.VoiceState
-	state      lavalink.PlayerState
-	stateAt    time.Time
-	volume     int
-	paused     bool
-	filters    lavalink.Filters
-	repeat     RepeatMode
-	crossfade  *lavalink.Crossfade
-	tape       *lavalink.Tape
-	errors     int
-	idleTimer  *time.Timer
-	destroyed  bool
-	// manualSkip marks an explicit skip via a crossfade transition, so the
-	// following TrackEnd (crossfade/gapless) advances even with RepeatTrack,
-	// like lavalink-client's internal_manualSkipPending.
-	manualSkip bool
-	// nextSync debounces NextTrack re-syncs after queue edits, like
-	// lavalink-client's scheduleNextTrackSync (50ms): rapid edits coalesce
-	// into one node call, and tests reading the synchronous Skip request
+	client         *Client
+	guildID        string
+	queue          *queue.Queue
+	log            *slog.Logger
+	cmdMu          sync.Mutex
+	mu             sync.RWMutex
+	node           *Node
+	channelID      string
+	selfMute       bool
+	selfDeaf       bool
+	serverMute     bool
+	serverDeaf     bool
+	suppress       bool
+	voice          lavalink.VoiceState
+	state          lavalink.PlayerState
+	stateAt        time.Time
+	volume         int
+	paused         bool
+	filters        lavalink.Filters
+	repeat         RepeatMode
+	crossfade      *lavalink.Crossfade
+	tape           *lavalink.Tape
+	idleTimer      *time.Timer
+	destroyed      bool
+	data           map[string]any
+	playing        bool
+	manualSkip     bool
+	skipped        bool
+	stopPlaying    bool
+	nodeChanging   bool
+	filtersDirty   bool
+	errorAt        []time.Time
+	autoplaying    bool
+	autoplayFailed time.Time
 	// win the race against the delayed sync.
 	nextSyncTimer *time.Timer
 	nextSyncGen   int
@@ -254,19 +256,122 @@ func (p *Player) Destroyed() bool {
 	return p.destroyed
 }
 
-// setState records a playerUpdate frame.
-func (p *Player) setState(state lavalink.PlayerState) {
-	p.mu.Lock()
+func (p *Player) applyState(state lavalink.PlayerState) bool {
+	if !state.Time.IsZero() && !p.state.Time.IsZero() && state.Time.Before(p.state.Time.Time) {
+		return false
+	}
 	p.state, p.stateAt = state, time.Now()
+	return true
+}
+
+// setState records a playerUpdate frame and reports whether it was the newest.
+func (p *Player) setState(state lavalink.PlayerState) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.applyState(state)
+}
+
+// absorb takes the node's word for the player's state after a command. A reply
+// the node stamped before one already taken is stale whole: its volume, pause
+// and filters are as out of date as its position.
+func (p *Player) absorb(info lavalink.PlayerInfo) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// A reply that carries no state at all says nothing about the timeline, so
+	// it must not wipe a position just set locally — a seek would be undone by
+	// its own reply. A real node always sends one; this is the guard for the
+	// ones that do not.
+	if info.State != (lavalink.PlayerState{}) && !p.applyState(info.State) {
+		// Stale whole: a reply the node stamped before one already taken has a
+		// volume and pause as out of date as its position.
+		return
+	}
+	p.volume, p.paused, p.filters = info.Volume, info.Paused, info.Filters
+}
+
+// markPosition moves the local timeline without waiting for the node, the way
+// lavalink-client's seek() writes lastPosition/lastPositionChange before its
+// request. Without it Position() keeps interpolating the old timeline for a
+// whole round trip, and a frame stamped before the seek can undo it entirely.
+func (p *Player) markPosition(position lavalink.Duration) {
+	now := time.Now()
+	p.mu.Lock()
+	p.state.Position, p.stateAt = position, now
+	p.state.Time = lavalink.Timestamp{Time: now}
 	p.mu.Unlock()
 }
 
-// absorb takes the node's word for the player's state after a command.
-func (p *Player) absorb(info lavalink.PlayerInfo) {
+func (p *Player) restart(ticking bool) {
 	p.mu.Lock()
-	p.volume, p.paused, p.filters = info.Volume, info.Paused, info.Filters
-	p.state, p.stateAt = info.State, time.Now()
+	p.state.Position = 0
+	if ticking {
+		p.stateAt = time.Now()
+	} else {
+		p.stateAt = time.Time{}
+	}
 	p.mu.Unlock()
+}
+
+// resetStateClock reopens the freshness gate: a player that moved to another node
+// must not hold the new node's frames against the old node's clock.
+func (p *Player) resetStateClock() {
+	p.mu.Lock()
+	p.state.Time = lavalink.Timestamp{}
+	p.mu.Unlock()
+}
+
+// cmd runs a track-changing command under cmdMu. Every path that edits the queue
+// and tells the node about it in the same breath goes through here.
+func (p *Player) cmd(ctx context.Context, f func(context.Context) error) error {
+	p.cmdMu.Lock()
+	defer p.cmdMu.Unlock()
+	return f(ctx)
+}
+
+// goCmd runs one off the node's read loop, which must never block on a request.
+func (p *Player) goCmd(f func(context.Context) error) {
+	go p.background(func(ctx context.Context) error { return p.cmd(ctx, f) })
+}
+
+// started reports whether the node told us a track is decoding, which is
+// lavalink-client's player.playing: unlike [Player.Playing] it stays true across
+// a pause, because the node still holds the track.
+func (p *Player) started() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.playing
+}
+
+// setStarted records the node starting or dropping a track.
+func (p *Player) setStarted(playing bool) {
+	p.mu.Lock()
+	p.playing = playing
+	p.mu.Unlock()
+}
+
+// changingNode reports whether a [Player.MoveNode] is in flight.
+func (p *Player) changingNode() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.nodeChanging
+}
+
+// Set attaches arbitrary data to the player, like lavalink-client's
+// Player#setData: the usual home for a text channel id or a requester.
+func (p *Player) Set(key string, value any) {
+	p.mu.Lock()
+	if p.data == nil {
+		p.data = map[string]any{}
+	}
+	p.data[key] = value
+	p.mu.Unlock()
+}
+
+// Get returns data [Player.Set] attached, or nil.
+func (p *Player) Get(key string) any {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.data[key]
 }
 
 // update patches the player on its node and takes the reply as the new truth.
@@ -293,17 +398,26 @@ func (p *Player) Update(ctx context.Context, update lavalink.PlayerUpdate) error
 
 // Play starts a track now and unpauses. Queued tracks follow on their own.
 func (p *Player) Play(ctx context.Context, track lavalink.Track) error {
-	return p.play(ctx, track)
+	return p.cmd(ctx, func(ctx context.Context) error { return p.play(ctx, track, false) })
 }
 
-func (p *Player) play(ctx context.Context, track lavalink.Track) error {
+func (p *Player) play(ctx context.Context, track lavalink.Track, noReplace bool) error {
 	p.stopIdle()
+	// A new track supersedes whatever the last command asked the coming TrackEnd
+	// to do: that end belongs to a track nobody is waiting on any more, and a
+	// flag left set would steer the wrong one.
+	p.takeIntent()
 	p.queue.SetCurrent(ctx, &track)
 	resume := false
-	if err := p.update(ctx, lavalink.PlayerUpdate{
-		Track:  &lavalink.UpdateTrack{Encoded: lavalink.Value(track.Encoded), UserData: track.UserData},
-		Paused: &resume,
-	}); err != nil {
+	update := lavalink.PlayerUpdate{
+		Track:     &lavalink.UpdateTrack{Encoded: lavalink.Value(track.Encoded), UserData: track.UserData},
+		Paused:    &resume,
+		NoReplace: noReplace,
+	}
+	if crossfade := p.Crossfade(); crossfade != nil && crossfade.Enable {
+		update.Crossfade = lavalink.Value(*crossfade)
+	}
+	if err := p.update(ctx, update); err != nil {
 		return err
 	}
 	// Keep the pre-buffered successor in step: the head changed (or the track
@@ -315,19 +429,32 @@ func (p *Player) play(ctx context.Context, track lavalink.Track) error {
 // PlayIdentifier lets the node resolve a search phrase or URL. Use
 // [Client.Search] to see the tracks first.
 func (p *Player) PlayIdentifier(ctx context.Context, identifier string) error {
-	p.stopIdle()
-	resume := false
-	return p.update(ctx, lavalink.PlayerUpdate{
-		Track:  &lavalink.UpdateTrack{Identifier: identifier},
-		Paused: &resume,
+	return p.cmd(ctx, func(ctx context.Context) error {
+		p.stopIdle()
+		resume := false
+		return p.update(ctx, lavalink.PlayerUpdate{
+			Track:  &lavalink.UpdateTrack{Identifier: identifier},
+			Paused: &resume,
+		})
 	})
 }
 
 // Stop stops playback and clears the queue, leaving the player connected.
 func (p *Player) Stop(ctx context.Context) error {
-	p.queue.Clear(ctx)
-	p.queue.SetCurrent(ctx, nil)
-	return p.update(ctx, lavalink.PlayerUpdate{Track: &lavalink.UpdateTrack{Encoded: lavalink.Null[string]()}})
+	return p.cmd(ctx, func(ctx context.Context) error {
+		p.queue.Clear(ctx)
+		p.queue.SetCurrent(ctx, nil)
+		p.mu.Lock()
+		p.stopPlaying = true
+		p.mu.Unlock()
+		err := p.update(ctx, lavalink.PlayerUpdate{Track: &lavalink.UpdateTrack{Encoded: lavalink.Null[string]()}})
+		if err != nil {
+			p.mu.Lock()
+			p.stopPlaying = false
+			p.mu.Unlock()
+		}
+		return err
+	})
 }
 
 // Pause pauses or resumes. A tape ramps the pitch around it; see
@@ -351,19 +478,28 @@ func (p *Player) Pause(ctx context.Context, pause bool) error {
 // Resume unpauses playback.
 func (p *Player) Resume(ctx context.Context) error { return p.Pause(ctx, false) }
 
-// Seek jumps to a position in the current track.
+// ErrNotSeekable is returned by [Player.Seek] for a live stream, or any track the
+// node reported as not seekable.
+var ErrNotSeekable = errors.New("gurulink: current track is not seekable")
+
+// Seek jumps to a position in the current track. Nothing playing is a no-op; a
+// position past the end is clamped to it.
 func (p *Player) Seek(ctx context.Context, position lavalink.Duration) error {
-	if position < 0 {
-		position = 0
+	// The same three guards as lavalink-client's seek(), so an impossible seek
+	// never reaches the node and comes back as a REST error.
+	current := p.queue.Current()
+	if current == nil {
+		return nil
 	}
-	if err := p.update(ctx, lavalink.PlayerUpdate{Position: &position}); err != nil {
-		return err
+	if current.Info.IsStream || !current.Info.IsSeekable {
+		return ErrNotSeekable
 	}
-	// ponytail: filters swallow the first seek, so nudge twice like the TS client.
-	if p.Filters().Active() {
-		return p.update(ctx, lavalink.PlayerUpdate{Position: &position})
+	if length := current.Info.Length; length > 0 {
+		position = min(position, length)
 	}
-	return nil
+	position = max(position, 0)
+	p.markPosition(position)
+	return p.update(ctx, lavalink.PlayerUpdate{Position: &position})
 }
 
 // SetVolume sets the volume, 0 to 1000. Above 100 the node amplifies and may
@@ -379,10 +515,18 @@ func (p *Player) SetEndTime(ctx context.Context, end lavalink.Duration) error {
 }
 
 // Skip plays the next track, ignoring [RepeatTrack]. With crossfade on it fades
-// into it rather than cutting. The queue moves on the following TrackEnd, like
-// lavalink-client: the update only arms the transition, and manualSkip makes
-// that end ignore repeat.
+// into it rather than cutting.
+//
+// Either way the queue moves on the following TrackEnd, never here: that is
+// lavalink-client's design, and it is what keeps one writer on the queue. A skip
+// that advanced locally would race the end of the track it is skipping, and the
+// two together would consume two tracks for one press.
 func (p *Player) Skip(ctx context.Context) error {
+	return p.cmd(ctx, p.skip)
+}
+
+// skip is [Player.Skip] with cmdMu already held.
+func (p *Player) skip(ctx context.Context) error {
 	if next, ok := p.queue.Peek(); ok && p.Playing() && p.crossfading() {
 		p.mu.Lock()
 		p.manualSkip = true
@@ -399,7 +543,23 @@ func (p *Player) Skip(ctx context.Context) error {
 		p.mu.Unlock()
 		p.log.Debug("gurulink: skip with a crossfade", slog.Any("err", err))
 	}
-	return p.next(ctx, lavalink.ReasonStopped)
+	if p.queue.Current() == nil {
+		return p.next(ctx, lavalink.ReasonStopped)
+	}
+	p.mu.Lock()
+	p.skipped = true
+	p.mu.Unlock()
+	resume := false
+	err := p.update(ctx, lavalink.PlayerUpdate{
+		Track:  &lavalink.UpdateTrack{Encoded: lavalink.Null[string]()},
+		Paused: &resume,
+	})
+	if err != nil {
+		p.mu.Lock()
+		p.skipped = false
+		p.mu.Unlock()
+	}
+	return err
 }
 
 // takeManualSkip reports and clears a pending manual skip.
@@ -409,6 +569,23 @@ func (p *Player) takeManualSkip() bool {
 	p.manualSkip = false
 	p.mu.Unlock()
 	return manual
+}
+
+func (p *Player) takeIntent() (skipped, stopped bool) {
+	p.mu.Lock()
+	skipped, stopped = p.skipped, p.stopPlaying
+	p.skipped, p.stopPlaying = false, false
+	p.mu.Unlock()
+	return skipped, stopped
+}
+
+func (p *Player) advance(ctx context.Context) (lavalink.Track, bool) {
+	if p.Repeat() == RepeatQueue {
+		if current := p.queue.Current(); current != nil && !p.queue.Replayed() {
+			p.queue.Add(ctx, *current)
+		}
+	}
+	return p.queue.Advance(ctx)
 }
 
 // effectiveNext is the track the node should pre-buffer: the repeat-track
@@ -434,48 +611,82 @@ func (p *Player) effectiveNext() (lavalink.Track, bool) {
 
 // SkipTo skips the queued tracks before index i and plays that one.
 func (p *Player) SkipTo(ctx context.Context, i int) error {
-	if i < 0 || i >= p.queue.Len() {
-		return fmt.Errorf("gurulink: skip to %d out of range (%d tracks)", i, p.queue.Len())
-	}
-	p.queue.RemoveRange(ctx, 0, i)
-	return p.Skip(ctx)
+	return p.cmd(ctx, func(ctx context.Context) error {
+		if i < 0 || i >= p.queue.Len() {
+			return fmt.Errorf("gurulink: skip to %d out of range (%d tracks)", i, p.queue.Len())
+		}
+		p.queue.RemoveRange(ctx, 0, i)
+		return p.skip(ctx)
+	})
 }
 
 // Back replays the last track, pushing the current one to the front of the
 // queue.
 func (p *Player) Back(ctx context.Context) error {
-	track, ok := p.queue.Back(ctx)
-	if !ok {
-		return errors.New("gurulink: nothing played yet")
+	return p.cmd(ctx, func(ctx context.Context) error {
+		track, ok := p.queue.Back(ctx)
+		if !ok {
+			return errors.New("gurulink: nothing played yet")
+		}
+		// Back already made it current.
+		p.stopIdle()
+		resume := false
+		if err := p.update(ctx, lavalink.PlayerUpdate{
+			Track:  &lavalink.UpdateTrack{Encoded: lavalink.Value(track.Encoded), UserData: track.UserData},
+			Paused: &resume,
+		}); err != nil {
+			return err
+		}
+		p.schedulePreBuffer()
+		return nil
+	})
+}
+
+func (p *Player) autoplay(ctx context.Context) bool {
+	if p.client.cfg.Autoplay == nil {
+		return false
 	}
-	// Back already made it current.
-	p.stopIdle()
-	resume := false
-	if err := p.update(ctx, lavalink.PlayerUpdate{
-		Track:  &lavalink.UpdateTrack{Encoded: lavalink.Value(track.Encoded), UserData: track.UserData},
-		Paused: &resume,
-	}); err != nil {
-		return err
+	p.mu.Lock()
+	if p.autoplaying || time.Since(p.autoplayFailed) < p.client.cfg.AutoplayCooldown {
+		p.mu.Unlock()
+		return false
 	}
-	p.schedulePreBuffer()
-	return nil
+	p.autoplaying = true
+	p.mu.Unlock()
+
+	before := p.queue.Len()
+	err := p.client.cfg.Autoplay(ctx, p)
+	grew := p.queue.Len() > before
+
+	p.mu.Lock()
+	p.autoplaying = false
+	if !grew {
+		p.autoplayFailed = time.Now()
+	} else {
+		p.autoplayFailed = time.Time{}
+	}
+	p.mu.Unlock()
+
+	if err != nil {
+		p.client.emit(&ErrorEvent{Node: p.Node(), Err: fmt.Errorf("gurulink: autoplay: %w", err)})
+	}
+	return grew
 }
 
 // next plays the following track, asking [Config.Autoplay] when the queue is dry
 // and emitting [QueueEndEvent] when that is empty too.
 func (p *Player) next(ctx context.Context, reason lavalink.TrackEndReason) error {
 	ended := p.queue.Current()
-	track, ok := p.queue.Advance(ctx)
-	if !ok && p.client.cfg.Autoplay != nil {
-		if err := p.client.cfg.Autoplay(ctx, p); err != nil {
-			p.client.emit(&ErrorEvent{Node: p.Node(), Err: fmt.Errorf("gurulink: autoplay: %w", err)})
-		}
-		track, ok = p.queue.Advance(ctx)
+	track, ok := p.advance(ctx)
+	if !ok && p.autoplay(ctx) {
+		track, ok = p.advance(ctx)
 	}
 	if ok {
-		return p.play(ctx, track)
+
+		return p.play(ctx, track, true)
 	}
 
+	p.setStarted(false)
 	p.startIdle()
 	var last lavalink.Track
 	if ended != nil {
@@ -503,13 +714,14 @@ func (p *Player) SetCrossfade(ctx context.Context, crossfade *lavalink.Crossfade
 	p.crossfade = crossfade
 	p.mu.Unlock()
 
-	if p.crossfading() {
-		return p.PreBuffer(ctx)
-	}
-	// Off: drop the successor too, so the node has nothing left to fade into.
-	return p.update(ctx, lavalink.PlayerUpdate{
-		Crossfade: lavalink.Null[lavalink.Crossfade](),
-		NextTrack: lavalink.Null[lavalink.UpdateTrack](),
+	return p.cmd(ctx, func(ctx context.Context) error {
+		if p.crossfading() {
+			return p.preBuffer(ctx)
+		}
+		return p.update(ctx, lavalink.PlayerUpdate{
+			Crossfade: lavalink.Null[lavalink.Crossfade](),
+			NextTrack: lavalink.Null[lavalink.UpdateTrack](),
+		})
 	})
 }
 
@@ -541,24 +753,67 @@ func (p *Player) SetTape(ctx context.Context, tape *lavalink.Tape) error {
 // track start and after every queue change; call it again after editing the
 // queue. Needs a Kairo node.
 func (p *Player) PreBuffer(ctx context.Context) error {
+	return p.cmd(ctx, p.preBuffer)
+}
+
+// preBuffer is [Player.PreBuffer] with cmdMu already held.
+func (p *Player) preBuffer(ctx context.Context) error {
 	crossfade := p.Crossfade()
 	if crossfade == nil || !crossfade.Enable {
 		return nil
 	}
+	if p.changingNode() {
+		return nil
+	}
+	p.mu.RLock()
+	gen := p.nextSyncGen
+	p.mu.RUnlock()
+
 	// A dry queue clears the successor rather than fading into a stale track.
 	// Repeat modes name the looped track, like lavalink-client's
 	// effectiveNextCandidate, so a looped track fades into itself instead of
 	// cutting or stalling.
 	update := lavalink.PlayerUpdate{Crossfade: lavalink.Value(*crossfade), NextTrack: lavalink.Null[lavalink.UpdateTrack]()}
-	if next, ok := p.effectiveNext(); ok {
+	next, ok := p.effectiveNext()
+	if !ok && p.Repeat() == RepeatOff && p.started() && p.queue.Current() != nil && p.autoplay(ctx) {
+		next, ok = p.effectiveNext()
+	}
+	if ok {
 		update.NextTrack = lavalink.Value(lavalink.UpdateTrack{Encoded: lavalink.Value(next.Encoded), UserData: next.UserData})
+	}
+	// Re-check after the work above, which can block on autoplay: a newer edit
+	// means a newer sync is already on its way, and this one would overwrite it
+	// with a stale successor. lavalink-client re-checks its generation the same
+	// way after awaiting.
+	p.mu.RLock()
+	stale := gen != p.nextSyncGen || p.nodeChanging
+	p.mu.RUnlock()
+	if stale {
+		return nil
 	}
 	return p.update(ctx, update)
 }
 
 // SetFilters replaces the player's filters.
 func (p *Player) SetFilters(ctx context.Context, filters lavalink.Filters) error {
-	return p.update(ctx, lavalink.PlayerUpdate{Filters: &filters})
+	if err := p.update(ctx, lavalink.PlayerUpdate{Filters: &filters}); err != nil {
+		return err
+	}
+	if filters.Active() {
+		p.mu.Lock()
+		p.filtersDirty = true
+		p.mu.Unlock()
+	}
+	return nil
+}
+
+// takeFiltersDirty reports and clears the pending filter re-seek.
+func (p *Player) takeFiltersDirty() bool {
+	p.mu.Lock()
+	dirty := p.filtersDirty
+	p.filtersDirty = false
+	p.mu.Unlock()
+	return dirty
 }
 
 // UpdateFilters changes one filter without rebuilding the rest:

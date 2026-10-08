@@ -213,3 +213,84 @@ func TestStore(t *testing.T) {
 		t.Errorf("Delete without a store does nothing: %v", err)
 	}
 }
+
+// TestBackDoesNotDuplicateHistory covers a replayed track not being retired into
+// the history it came out of: without the marker, repeated Back calls walk the
+// same track instead of going further back.
+func TestBackDoesNotDuplicateHistory(t *testing.T) {
+	ctx := context.Background()
+	q := New("g", Config{})
+
+	q.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	q.Add(ctx, lavalink.Track{Encoded: "two"}, lavalink.Track{Encoded: "three"})
+	// Play through one and two so both are in the history.
+	q.Advance(ctx)
+	q.Advance(ctx)
+	if current := q.Current(); current == nil || current.Encoded != "three" {
+		t.Fatalf("setup: current is %v, want three", current)
+	}
+	if prev := q.Previous(); len(prev) != 2 || prev[0].Encoded != "two" || prev[1].Encoded != "one" {
+		t.Fatalf("setup: history is %v, want [two one]", prev)
+	}
+
+	// Back to two: it leaves the history and must not be put back by retiring.
+	got, ok := q.Back(ctx)
+	if !ok || got.Encoded != "two" {
+		t.Fatalf("back gave %v, %v; want two", got, ok)
+	}
+	if !q.Replayed() {
+		t.Error("a track out of the history should be marked replayed")
+	}
+	if prev := q.Previous(); len(prev) != 1 || prev[0].Encoded != "one" {
+		t.Fatalf("history is %v after a back, want [one]", prev)
+	}
+
+	// Back again has to reach one, not two.
+	got, ok = q.Back(ctx)
+	if !ok || got.Encoded != "one" {
+		t.Errorf("a second back gave %v, %v; want one", got, ok)
+	}
+}
+
+// TestAdvanceAfterBackKeepsHistory covers the other direction: playing on from a
+// replayed track must not duplicate it in the history either.
+func TestAdvanceAfterBackKeepsHistory(t *testing.T) {
+	ctx := context.Background()
+	q := New("g", Config{})
+
+	q.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	q.Add(ctx, lavalink.Track{Encoded: "two"})
+	q.Advance(ctx) // current two, history [one]
+
+	if _, ok := q.Back(ctx); !ok {
+		t.Fatal("setup: back")
+	}
+	// current is one (replayed), two is at the head again.
+	q.Advance(ctx)
+	if prev := q.Previous(); len(prev) != 0 {
+		t.Errorf("history is %v after advancing off a replayed track, want empty", prev)
+	}
+	if q.Replayed() {
+		t.Error("advancing should clear the replayed marker")
+	}
+}
+
+// TestSetCurrentClearsReplayed covers a fresh track dropping the marker, so it is
+// retired normally when it ends.
+func TestSetCurrentClearsReplayed(t *testing.T) {
+	ctx := context.Background()
+	q := New("g", Config{})
+
+	q.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
+	q.Advance(ctx)
+	if _, ok := q.Back(ctx); !ok {
+		t.Fatal("setup: back")
+	}
+	if !q.Replayed() {
+		t.Fatal("setup: expected a replayed current")
+	}
+	q.SetCurrent(ctx, &lavalink.Track{Encoded: "fresh"})
+	if q.Replayed() {
+		t.Error("a fresh current should not be marked replayed")
+	}
+}

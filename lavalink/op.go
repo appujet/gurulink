@@ -50,9 +50,9 @@ const (
 	ReasonGapless   TrackEndReason = "gapless"
 )
 
-// StartNext reports whether the client should now play the next queued track.
-// Cleanup is a failed track the node dropped, like loadFailed: skip past it
-// rather than stalling on it.
+// StartNext reports whether the client should now play the next queued track on
+// this reason alone. Cleanup is a failed track the node dropped, like
+// loadFailed: skip past it rather than stalling on it.
 func (r TrackEndReason) StartNext() bool {
 	return r == ReasonFinished || r == ReasonLoadFailed || r == ReasonCleanup
 }
