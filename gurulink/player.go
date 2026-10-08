@@ -585,37 +585,9 @@ func (p *Player) Resume(ctx context.Context) error { return p.Pause(ctx, false) 
 // node reported as not seekable.
 var ErrNotSeekable = errors.New("gurulink: current track is not seekable")
 
-// ErrTransitioning is returned by [Player.Seek] and [Player.SetEndTime] while a
-// crossfade skip is still handing over. See [Player.Transitioning].
-var ErrTransitioning = errors.New("gurulink: a crossfade skip is still completing")
-
-// Transitioning reports whether a crossfade skip is still handing over to its
-// successor, which lasts the crossfade's manual duration and ends with the
-// TrackEnd that promotes it.
-//
-// Two tracks are audible in that window and the node has already moved its own
-// current slot to the successor, so there is no single track a seek could mean.
-// [Player.Seek] and [Player.SetEndTime] report [ErrTransitioning] rather than
-// act on the wrong one; wait for [TrackPromotedEvent] or the [TrackEndEvent]
-// that carries a promoted reason.
-func (p *Player) Transitioning() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.manualSkip
-}
-
 // Seek jumps to a position in the current track. Nothing playing is a no-op; a
 // position past the end is clamped to it.
 func (p *Player) Seek(ctx context.Context, position lavalink.Duration) error {
-	// A crossfade skip hands over by playhead: the node promotes the successor
-	// when the outgoing track reaches the end of the fade window. Seeking moves
-	// that playhead, so a seek here lands on a track the node no longer calls
-	// current and can leave the hand-over unable to finish — after which the
-	// node ignores every further transition until something promotes the one it
-	// is holding. Refuse instead of wedging it.
-	if p.Transitioning() {
-		return ErrTransitioning
-	}
 	// The same three guards as lavalink-client's seek(), so an impossible seek
 	// never reaches the node and comes back as a REST error.
 	current := p.queue.Current()
@@ -642,11 +614,6 @@ func (p *Player) SetVolume(ctx context.Context, volume int) error {
 
 // SetEndTime stops the current track early, at a position in it.
 func (p *Player) SetEndTime(ctx context.Context, end lavalink.Duration) error {
-	// Same reason as [Player.Seek]: an end time is another marker on the
-	// outgoing track's timeline, and the hand-over is already using one.
-	if p.Transitioning() {
-		return ErrTransitioning
-	}
 	return p.update(ctx, lavalink.PlayerUpdate{EndTime: &end})
 }
 
@@ -851,13 +818,16 @@ func (p *Player) SetCrossfade(ctx context.Context, crossfade *lavalink.Crossfade
 	p.mu.Unlock()
 
 	return p.cmd(ctx, func(ctx context.Context) error {
-		if p.crossfading() {
-			return p.preBuffer(ctx)
+		// The settings have to be sent from here, not left to the pre-buffer
+		// sync: that one deliberately carries nextTrack alone, because Kairo
+		// re-arms its transition whenever it is given crossfade options and
+		// that would throw away the marker a hand-over is promoting on. Off
+		// drops the successor too, so the node has nothing left to fade into.
+		update := lavalink.PlayerUpdate{Crossfade: lavalink.Null[lavalink.Crossfade]()}
+		if effective := p.Crossfade(); effective != nil && effective.Enable {
+			update.Crossfade = lavalink.Value(*effective)
 		}
-		return p.update(ctx, lavalink.PlayerUpdate{
-			Crossfade: lavalink.Null[lavalink.Crossfade](),
-			NextTrack: lavalink.Null[lavalink.UpdateTrack](),
-		})
+		return p.update(ctx, update)
 	})
 }
 
@@ -901,15 +871,6 @@ func (p *Player) preBuffer(ctx context.Context) error {
 	if p.changingNode() {
 		return nil
 	}
-	// A hand-over is already running, and the node will not take a successor
-	// until it finishes: it holds the one it is promoting. Worse, the crossfade
-	// settings this request carries make the node re-arm its transition, which
-	// throws away the marker the pending hand-over promotes on — so sending
-	// this now is what leaves a skip unable to finish. The TrackEnd that
-	// promotes it schedules another sync.
-	if p.Transitioning() {
-		return nil
-	}
 	p.mu.RLock()
 	gen := p.nextSyncGen
 	p.mu.RUnlock()
@@ -918,7 +879,8 @@ func (p *Player) preBuffer(ctx context.Context) error {
 	// Repeat modes name the looped track, like lavalink-client's
 	// effectiveNextCandidate, so a looped track fades into itself instead of
 	// cutting or stalling.
-	update := lavalink.PlayerUpdate{Crossfade: lavalink.Value(*crossfade), NextTrack: lavalink.Null[lavalink.UpdateTrack]()}
+
+	update := lavalink.PlayerUpdate{NextTrack: lavalink.Null[lavalink.UpdateTrack]()}
 	next, ok := p.effectiveNext()
 	if !ok && p.Repeat() == RepeatOff && p.started() && p.queue.Current() != nil && p.autoplay(ctx) {
 		next, ok = p.effectiveNext()

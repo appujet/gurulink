@@ -1357,16 +1357,18 @@ func TestCrossfadeUntouchedByStockNode(t *testing.T) {
 }
 
 // TestCrossfadeSeekSkipSequence is the Reever report, exactly:
-// crossfade on, play, seek, skip, seek, skip twice.
+// crossfade on, play, seek, skip, seek, skip.
 //
-// A crossfade skip hands over by playhead — the node promotes the successor
-// when the outgoing track reaches the end of the fade window, and the marker it
-// uses lives on that track's timeline. Two things used to destroy it: a Seek,
-// which moves the playhead away from the marker, and the pre-buffer sync, whose
-// crossfade settings make the node re-arm and throw the marker away. Either left
-// the node holding a successor it could never promote, after which it ignores
-// every new transition and only promotes the stuck one — so the next skip did
-// nothing visible and the one after it finally advanced.
+// A crossfade skip hands over by playhead: the node promotes the successor when
+// the outgoing track reaches the end of the fade window, and the marker it
+// promotes on lives on that track's timeline. Gululink's pre-buffer sync used to
+// run 50ms after every skip carrying the crossfade settings, and a Kairo node
+// re-arms its transition whenever it is given those — which throws the marker
+// away. The hand-over could then never finish, so the next skip merely completed
+// the stuck one and only the one after that advanced.
+//
+// A seek must keep working throughout: it is safe while a hand-over is pending,
+// which is the whole reason the sync has to stay out of its way.
 func TestCrossfadeSeekSkipSequence(t *testing.T) {
 	client := testClient(t, func(c *Config) {
 		c.Crossfade = &lavalink.Crossfade{Enable: true, DurationMs: 3000, ManualDurationMs: 3500}
@@ -1399,6 +1401,18 @@ func TestCrossfadeSeekSkipSequence(t *testing.T) {
 			return ""
 		}
 	}
+	// waitForBody reads until a body contains want, or gives up.
+	waitForBody := func(want string) string {
+		t.Helper()
+		var last string
+		for i := 0; i < 8; i++ {
+			last = nextBody()
+			if strings.Contains(last, want) {
+				return last
+			}
+		}
+		return last
+	}
 
 	ctx := context.Background()
 
@@ -1413,7 +1427,7 @@ func TestCrossfadeSeekSkipSequence(t *testing.T) {
 	if err := player.Seek(ctx, 30*lavalink.Second); err != nil {
 		t.Fatalf("the first seek failed: %v", err)
 	}
-	if body := nextBody(); !strings.Contains(body, `"position":30000`) {
+	if body := waitForBody(`"position":30000`); !strings.Contains(body, `"position":30000`) {
 		t.Errorf("the first seek sent %s", body)
 	}
 
@@ -1425,57 +1439,53 @@ func TestCrossfadeSeekSkipSequence(t *testing.T) {
 	if !strings.Contains(body, `"transition":true`) || !strings.Contains(body, `"nextTrack":{"encoded":"two"}`) {
 		t.Fatalf("the skip did not arm a transition: %s", body)
 	}
-	if !player.Transitioning() {
-		t.Fatal("the player should report the hand-over in flight")
+	// The skip must not carry crossfade settings either: sending them is what
+	// made the node re-arm and drop the marker for its own hand-over.
+	if strings.Contains(body, `"crossfade"`) {
+		t.Errorf("the skip re-armed the node's crossfade and would drop its own promotion marker: %s", body)
 	}
 
-	// 4. Seek during the hand-over. It must refuse rather than move the playhead
-	//    the node is promoting on — that is the bug.
-	if err := player.Seek(ctx, 10*lavalink.Second); !errors.Is(err, ErrTransitioning) {
-		t.Errorf("seeking mid-hand-over returned %v, want ErrTransitioning", err)
+	// 4. Seek during the hand-over. This has to work — it is the reported bug —
+	//    and the request must carry nothing but the position.
+	if err := player.Seek(ctx, 10*lavalink.Second); err != nil {
+		t.Fatalf("seeking mid-hand-over failed: %v", err)
 	}
-	if err := player.SetEndTime(ctx, 20*lavalink.Second); !errors.Is(err, ErrTransitioning) {
-		t.Errorf("setting an end time mid-hand-over returned %v, want ErrTransitioning", err)
+	body = nextBody()
+	if !strings.Contains(body, `"position":10000`) {
+		t.Errorf("the mid-hand-over seek sent %s", body)
 	}
-	select {
-	case body := <-bodies:
-		t.Fatalf("a request reached the node during the hand-over: %s", body)
-	case <-time.After(150 * time.Millisecond):
+	if strings.Contains(body, `"crossfade"`) || strings.Contains(body, `"nextTrack"`) {
+		t.Errorf("the seek touched the transition state: %s", body)
 	}
 
-	// 4b. The debounced pre-buffer must stay silent too: its crossfade settings
-	//     are what made the node re-arm and drop the promotion marker.
+	// 4b. The debounced pre-buffer may name a successor, but it must never carry
+	//     the crossfade settings: those are what re-arm the node.
 	player.queue.Add(ctx, seekable("four"))
-	select {
-	case body := <-bodies:
-		t.Fatalf("a queue edit pre-buffered during the hand-over: %s", body)
-	case <-time.After(250 * time.Millisecond):
+	body = nextBody()
+	if !strings.Contains(body, `"nextTrack"`) {
+		t.Fatalf("the sync after the queue edit did not name a successor: %s", body)
+	}
+	if strings.Contains(body, `"crossfade"`) {
+		t.Errorf("the sync after the queue edit re-armed crossfade: %s", body)
 	}
 
-	// 5. The node finishes the hand-over. ONE skip is all it took, so the queue
-	//    advances here and the window closes.
+	// 5. The node finishes the hand-over on its own marker. One skip was enough,
+	//    so the queue advances here.
 	player.handle(ctx, &TrackEndEvent{
 		Player: player,
 		Track:  lavalink.Track{Encoded: "one"},
 		Reason: lavalink.ReasonCrossfade,
 	})
-	if player.Transitioning() {
-		t.Error("the hand-over should be over once the node promoted it")
-	}
 	if current := player.queue.Current(); current == nil || current.Encoded != "two" {
 		t.Fatalf("the queue did not advance on the promotion: %v", current)
 	}
 
-	// Seeking works again straight away, against the track now playing.
+	// Seeking works straight after too, against the track now playing.
 	if err := player.Seek(ctx, 45*lavalink.Second); err != nil {
 		t.Fatalf("the seek after the hand-over failed: %v", err)
 	}
-	var seen string
-	for i := 0; i < 8 && !strings.Contains(seen, `"position":45000`); i++ {
-		seen = nextBody()
-	}
-	if !strings.Contains(seen, `"position":45000`) {
-		t.Errorf("the seek after the hand-over sent %s", seen)
+	if body := waitForBody(`"position":45000`); !strings.Contains(body, `"position":45000`) {
+		t.Errorf("the seek after the hand-over sent %s", body)
 	}
 	drain()
 
@@ -1496,27 +1506,47 @@ func TestCrossfadeSeekSkipSequence(t *testing.T) {
 	}
 }
 
-// TestTransitioningClearedByNode is the backstop: a hand-over that never
-// produced a promoted TrackEnd must not leave seeking refused forever.
-func TestTransitioningClearedByNode(t *testing.T) {
+// TestSkipMidTransitionIsNotLost covers the flag surviving the event order Kairo
+// uses: it emits TrackStart for the successor at overlap start, well before the
+// TrackEnd that promotes it. Anything that clears the manual-skip intent at
+// TrackStart makes the promoting TrackEnd advance the queue a second time.
+func TestSkipMidTransitionIsNotLost(t *testing.T) {
 	client := testClient(t, func(c *Config) { c.Crossfade = &lavalink.Crossfade{Enable: true} })
 	bodies := make(chan []byte, 32)
 	player := newPlayer(client, testNode(t, client, bodies), "g")
+	go func() {
+		for range bodies {
+		}
+	}()
 
 	ctx := context.Background()
 	player.queue.SetCurrent(ctx, &lavalink.Track{Encoded: "one"})
-	player.queue.Add(ctx, lavalink.Track{Encoded: "two"})
+	player.queue.Add(ctx, lavalink.Track{Encoded: "two"}, lavalink.Track{Encoded: "three"})
 
 	if err := player.Skip(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !player.Transitioning() {
-		t.Fatal("setup: expected a hand-over in flight")
-	}
-	// Only a TrackStart arrives, with no promoted TrackEnd before it.
+	// Overlap start: the successor starts while the outgoing track fades.
 	player.handle(ctx, &TrackStartEvent{Player: player, Track: lavalink.Track{Encoded: "two"}})
-	if player.Transitioning() {
-		t.Error("a track starting should clear the hand-over flag")
+	// Then the hand-over lands. Exactly one advance.
+	player.handle(ctx, &TrackEndEvent{
+		Player: player,
+		Track:  lavalink.Track{Encoded: "one"},
+		Reason: lavalink.ReasonCrossfade,
+	})
+	if current := player.queue.Current(); current == nil || current.Encoded != "two" {
+		t.Fatalf("the queue is on %v, want two", current)
+	}
+	if got := player.queue.Tracks(); len(got) != 1 || got[0].Encoded != "three" {
+		t.Errorf("the queue advanced twice: %v", got)
+	}
+	// And the queue must still agree with what the node called current.
+	player.handle(ctx, &TrackPromotedEvent{Player: player, Track: lavalink.Track{Encoded: "two"}})
+	if current := player.queue.Current(); current == nil || current.Encoded != "two" {
+		t.Errorf("the promotion moved the queue again: %v", current)
+	}
+	if got := player.queue.Tracks(); len(got) != 1 || got[0].Encoded != "three" {
+		t.Errorf("the promotion duplicated or consumed the queue: %v", got)
 	}
 }
 

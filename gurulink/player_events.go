@@ -198,10 +198,6 @@ func (p *Player) endedTransition(ctx context.Context, e *TrackEndEvent) {
 // heal and the status would name one track while another is audible. It runs on
 // the read loop, so it converges rather than taking the command lock.
 func (p *Player) adopt(ctx context.Context, track lavalink.Track) {
-	// The node has told us what it is playing, so any hand-over is over. This is
-	// the backstop for one that never produced a promoted TrackEnd: without it a
-	// stuck flag would refuse every later seek.
-	p.takeManualSkip()
 	current := p.queue.Current()
 	// Only when the node is playing something unexpected: the queue moved under
 	// the pre-buffer (an AddNext, a removal, a shuffle between PreBuffer and
